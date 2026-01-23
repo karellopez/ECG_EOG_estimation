@@ -49,7 +49,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from scipy.signal import correlate, find_peaks
+from scipy.signal import correlate, find_peaks, welch
 from scipy.stats import pearsonr, kurtosis
 
 # =============================================================================
@@ -125,10 +125,16 @@ EOG_POS_SPIKE_MAX_PER_MIN = 80
 EOG_NEG_SPIKE_MAX_PER_MIN = 6
 
 # Weights for the unsupervised ICA score
-W_EOG_KURT = 0.25
-W_EOG_RATE = 0.25
-W_EOG_POS_SPIKE = 0.40
+W_EOG_KURT = 0.20
+W_EOG_RATE = 0.20
+W_EOG_POS_SPIKE = 0.30
 W_EOG_NEG_PENALTY = 0.10
+W_EOG_BANDPOWER = 0.20
+
+# Spectral shape heuristics: blinks are low-frequency dominant
+EOG_LOW_BAND = (0.5, 4.0)
+EOG_HIGH_BAND = (8.0, 30.0)
+EOG_BANDPOWER_SIGMOID_K = 1.5
 
 # Ensure output directory exists
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -505,8 +511,8 @@ def pick_best_ic_supervised_from_sources(sources: np.ndarray, eog_ref_proc: np.n
 # UNSUPERVISED ICA scoring (heuristics)
 # =============================================================================
 def eog_spike_strength_score(
-        x: np.ndarray,
-        sfreq: float,
+    x: np.ndarray,
+    sfreq: float,
         pos_thr_z: float = 3.5,
         neg_thr_z: float = 3.0,
         min_distance_sec: float = 0.20,
@@ -573,6 +579,43 @@ def eog_spike_strength_score(
     )
 
 
+def eog_bandpower_ratio_score(
+        x: np.ndarray,
+        sfreq: float,
+        low_band: tuple[float, float] = EOG_LOW_BAND,
+        high_band: tuple[float, float] = EOG_HIGH_BAND,
+) -> dict:
+    """
+    Low-frequency dominance score using Welch PSD.
+
+    Returns:
+      p_band: sigmoid score (0..1) for low/high bandpower ratio
+      bandpower_ratio: raw low/high ratio (unitless)
+    """
+    if len(x) < 4 or sfreq <= 0:
+        return dict(p_band=0.0, bandpower_ratio=float("nan"))
+
+    nperseg = min(len(x), int(round(4.0 * sfreq)))
+    if nperseg < 4:
+        return dict(p_band=0.0, bandpower_ratio=float("nan"))
+
+    freqs, psd = welch(x, fs=sfreq, nperseg=nperseg, noverlap=nperseg // 2)
+    low_mask = (freqs >= low_band[0]) & (freqs <= low_band[1])
+    high_mask = (freqs >= high_band[0]) & (freqs <= high_band[1])
+
+    if not np.any(low_mask) or not np.any(high_mask):
+        return dict(p_band=0.0, bandpower_ratio=float("nan"))
+
+    low_power = float(np.trapz(psd[low_mask], freqs[low_mask]))
+    high_power = float(np.trapz(psd[high_mask], freqs[high_mask]))
+    ratio = low_power / (high_power + 1e-12)
+
+    log_ratio = np.log10(ratio + 1e-12)
+    p_band = 1.0 / (1.0 + np.exp(-EOG_BANDPOWER_SIGMOID_K * log_ratio))
+
+    return dict(p_band=float(p_band), bandpower_ratio=float(ratio))
+
+
 def blink_likeness_score(ic: np.ndarray, sfreq: float) -> dict:
     """
     Compute an unsupervised "blink-likeness" score for a single ICA component.
@@ -631,12 +674,17 @@ def blink_likeness_score(ic: np.ndarray, sfreq: float) -> dict:
     p_pos = spike["p_pos"]
     p_neg_penalty = spike["p_neg_penalty"]
 
+    # (4) Low-frequency dominance (blink energy tends to be low-freq)
+    band = eog_bandpower_ratio_score(z, sfreq)
+    p_band = band["p_band"]
+
     # Combined score: weights are user-tunable constants above
     score = (
             W_EOG_KURT * p_kurt
             + W_EOG_RATE * p_rate
             + W_EOG_POS_SPIKE * p_pos
             + W_EOG_NEG_PENALTY * p_neg_penalty
+            + W_EOG_BANDPOWER * p_band
     )
 
     return dict(
@@ -645,6 +693,7 @@ def blink_likeness_score(ic: np.ndarray, sfreq: float) -> dict:
         p_rate=float(p_rate),
         p_pos=float(p_pos),
         p_neg_penalty=float(p_neg_penalty),
+        p_bandpower=float(p_band),
         rate_per_min=float(rate),
         kurtosis=float(k),
         n_prom_peaks=int(len(peaks)),
@@ -652,6 +701,7 @@ def blink_likeness_score(ic: np.ndarray, sfreq: float) -> dict:
         neg_rate_per_min=float(spike["neg_rate_per_min"]),
         n_pos_spikes=int(spike["n_pos"]),
         n_neg_spikes=int(spike["n_neg"]),
+        bandpower_ratio=float(band["bandpower_ratio"]),
     )
 
 
