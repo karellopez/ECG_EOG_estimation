@@ -728,24 +728,36 @@ def plot_overlay_meg_only(
 # =============================================================================
 results = []
 
-# Find all MEG FIF files under DATASET_ROOT (excluding derivatives and git folders)
-fif_files = sorted(
+# Find all MEG FIF/CTF files under DATASET_ROOT (excluding derivatives and git folders)
+fif_files = [
     p
     for p in Path(DATASET_ROOT).rglob("*_meg.fif")
     if p.is_file() and "derivatives" not in str(p) and ".git" not in str(p)
-)
+]
+ctf_files = [
+    p
+    for p in Path(DATASET_ROOT).rglob("*.ds")
+    if p.is_dir() and "derivatives" not in str(p) and ".git" not in str(p)
+]
+data_paths = sorted(fif_files + ctf_files)
 
-print(f"Found {len(fif_files)} FIF files")
+print(f"Found {len(data_paths)} FIF/CTF files")
 
-for fif_path in fif_files:
-    subject_id = fif_path.stem
+for data_path in data_paths:
+    subject_id = data_path.stem
     print(f"\nProcessing {subject_id}")
 
     # -------------------------------------------------------------------------
     # 1) Load data
     # -------------------------------------------------------------------------
     try:
-        raw = mne.io.read_raw_fif(fif_path, preload=True, verbose=False)
+        if data_path.suffix == ".fif":
+            raw = mne.io.read_raw_fif(data_path, preload=True, verbose=False)
+        elif data_path.suffix == ".ds":
+            raw = mne.io.read_raw_ctf(data_path, preload=True, verbose=False)
+        else:
+            print(f"  Unsupported file format: {data_path}")
+            continue
     except Exception as e:
         print(f"  ERROR reading file: {e}")
         continue
@@ -884,7 +896,7 @@ for fif_path in fif_files:
         results.append(
             dict(
                 subject=subject_id,
-                file=str(fif_path),
+                file=str(data_path),
                 sfreq_hz=sfreq,
                 n_samples=n,
                 ecg_channel="",
@@ -1024,7 +1036,7 @@ for fif_path in fif_files:
     results.append(
         dict(
             subject=subject_id,
-            file=str(fif_path),
+            file=str(data_path),
             sfreq_hz=sfreq,
             n_samples=n,
             ecg_channel=ecg_ch_name,
