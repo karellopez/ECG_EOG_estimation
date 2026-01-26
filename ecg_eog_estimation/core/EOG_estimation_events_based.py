@@ -789,7 +789,14 @@ def pick_best_ic_unsupervised_from_sources(
     """
     if mode == "fixed":
         idx = int(np.clip(fixed_ic, 0, sources.shape[0] - 1))
-        details = blink_likeness_score(sources[idx, :], sfreq)
+        details_pos = blink_likeness_score(sources[idx, :], sfreq)
+        details_neg = blink_likeness_score(-sources[idx, :], sfreq)
+        if details_neg["score"] > details_pos["score"]:
+            details = details_neg
+            details["flip_for_score"] = True
+        else:
+            details = details_pos
+            details["flip_for_score"] = False
         details["selection_mode"] = "fixed"
         return idx, details
 
@@ -798,7 +805,14 @@ def pick_best_ic_unsupervised_from_sources(
     best_details = None
 
     for i in range(sources.shape[0]):
-        details = blink_likeness_score(sources[i, :], sfreq)
+        details_pos = blink_likeness_score(sources[i, :], sfreq)
+        details_neg = blink_likeness_score(-sources[i, :], sfreq)
+        if details_neg["score"] > details_pos["score"]:
+            details = details_neg
+            details["flip_for_score"] = True
+        else:
+            details = details_pos
+            details["flip_for_score"] = False
         if details["score"] > best_score:
             best_score = details["score"]
             best_idx = i
@@ -1087,6 +1101,8 @@ def process_file(data_path: Path):
             sources, sfreq=sfreq, mode=ICA_UNSUP_MODE, fixed_ic=ICA_UNSUP_FIXED_IC
         )
         ica_unsup_raw = sources[ica_unsup_ic, :n_total]
+        if unsup_details.get("flip_for_score", False):
+            ica_unsup_raw = -ica_unsup_raw
     
         # MEG-only sign convention
         if UNSUP_SIGN_MODE == "frontal_proxy" and pca_front_unsup_proc is not None:

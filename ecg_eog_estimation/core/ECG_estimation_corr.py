@@ -527,7 +527,14 @@ def pick_best_ic_unsupervised(sources: np.ndarray, sfreq: float) -> tuple[int, d
     """
     all_details = []
     for i in range(sources.shape[0]):
-        d = unsupervised_ecg_ic_score(sources[i, :], sfreq)
+        d_pos = unsupervised_ecg_ic_score(sources[i, :], sfreq)
+        d_neg = unsupervised_ecg_ic_score(-sources[i, :], sfreq)
+        if d_neg["score"] > d_pos["score"]:
+            d = d_neg
+            d["flip_for_score"] = True
+        else:
+            d = d_pos
+            d["flip_for_score"] = False
         d["ic"] = int(i)
         all_details.append(d)
 
@@ -852,6 +859,8 @@ def process_file(data_path: Path):
     # Unsupervised selection is always possible (MEG-only)
     unsup_ic, unsup_details, _all_details_sorted = pick_best_ic_unsupervised(sources, sfreq)
     ecg_ica_unsup = sources[unsup_ic, :n]
+    if unsup_details.get("flip_for_score", False):
+        ecg_ica_unsup = -ecg_ica_unsup
     
     # Optional MEG-only sign stabilization (purely for plot readability):
     # Make the larger-magnitude side positive so spikes look consistent.

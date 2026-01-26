@@ -588,7 +588,14 @@ def pick_best_ic_unsupervised(sources: np.ndarray, sfreq: float) -> Tuple[int, D
     """
     all_details: List[Dict] = []
     for i in range(sources.shape[0]):
-        d = unsupervised_ecg_ic_score(sources[i, :], sfreq)
+        d_pos = unsupervised_ecg_ic_score(sources[i, :], sfreq)
+        d_neg = unsupervised_ecg_ic_score(-sources[i, :], sfreq)
+        if d_neg["score"] > d_pos["score"]:
+            d = d_neg
+            d["flip_for_score"] = True
+        else:
+            d = d_pos
+            d["flip_for_score"] = False
         d["ic"] = int(i)
         all_details.append(d)
 
@@ -1004,6 +1011,8 @@ def process_file(data_path: Path):
     
     # IC time course in sample space of raw_meg_only (same n_times as raw_meg_only)
     ecg_ica_unsup = sources[unsup_ic, :]
+    if unsup_details.get("flip_for_score", False):
+        ecg_ica_unsup = -ecg_ica_unsup
     
     # -------------------------------------------------------------------------
     # 6) Detect ECG events from the ICA-derived IC trace
@@ -1168,7 +1177,7 @@ def process_file(data_path: Path):
             diag_png,
             subject_id,
             sfreq,
-            ic_signal=sources[unsup_ic, :],
+            ic_signal=ecg_ica_unsup,
             unsup_details=unsup_details,
         )
     except Exception as e:
