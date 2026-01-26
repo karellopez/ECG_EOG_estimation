@@ -66,6 +66,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+from joblib import Parallel, delayed
 from scipy.signal import correlate, find_peaks
 from scipy.stats import pearsonr, kurtosis
 
@@ -82,6 +83,9 @@ OUTPUT_DIR = "/Users/karelo/Development/datasets/ds_small/derivatives/ecg_result
 
 # Plot window in seconds for time series panels (A/B/C/D)
 PLOT_SECONDS = 20
+
+# Parallel processing: set >1 to enable joblib across files
+N_JOBS = 1
 
 # Matching tolerance to consider a detected R-peak correct (seconds)
 MATCH_TOL_SEC = 0.05  # 50 ms
@@ -901,7 +905,6 @@ def plot_unsup_ic_diagnostics(
 # =============================================================================
 # MAIN PIPELINE
 # =============================================================================
-rows: List[Dict] = []
 
 # Discover files (FIF + CTF)
 fif_files = [
@@ -918,10 +921,10 @@ data_paths = sorted(fif_files + ctf_files)
 
 print(f"Found {len(data_paths)} FIF/CTF files")
 
-for data_path in data_paths:
+def process_file(data_path: Path):
     subject_id = data_path.stem
     print(f"\nProcessing {subject_id}")
-
+    
     # -------------------------------------------------------------------------
     # 1) Load raw data
     # -------------------------------------------------------------------------
@@ -932,13 +935,13 @@ for data_path in data_paths:
             raw = mne.io.read_raw_ctf(data_path, preload=True, verbose=False)
         else:
             print(f"  Unsupported file format: {data_path}")
-            continue
+            return None
     except Exception as e:
         print(f"  ERROR reading file: {e}")
-        continue
-
+        return None
+    
     sfreq = float(raw.info["sfreq"])
-
+    
     # -------------------------------------------------------------------------
     # 2) Find REAL ECG channel (needed for reference)
     # -------------------------------------------------------------------------
@@ -946,12 +949,12 @@ for data_path in data_paths:
     ecg_picks = mne.pick_types(raw.info, ecg=True)
     if len(ecg_picks) == 0:
         print("  No real ECG channel found -> skipping")
-        continue
-
+        return None
+    
     ecg_idx = int(ecg_picks[0])
     ecg_ch_name = raw.ch_names[ecg_idx]
     ecg_raw_real_full = raw.get_data(picks=[ecg_idx])[0]
-
+    
     # -------------------------------------------------------------------------
     # 3) Reference: find_ecg_events using REAL ECG channel
     #    - returns events + an "MNE ECG trace" (a processed helper signal)
@@ -967,13 +970,13 @@ for data_path in data_paths:
         ref_events_samp = extract_event_samples(ecg_events_ref)  # absolute samples
     except Exception as e:
         print(f"  ERROR find_ecg_events using real ECG: {e}")
-        continue
-
+        return None
+    
     # -------------------------------------------------------------------------
     # 4) Baseline test: find_ecg_events on MEG-only raw (MNE's baseline)
     # -------------------------------------------------------------------------
     raw_meg_only = raw.copy().pick_types(meg=True, eeg=False, eog=False, ecg=False, stim=False)
-
+    
     try:
         ecg_events_test, _, _, ecg_mne_from_meg = mne.preprocessing.find_ecg_events(
             raw_meg_only,
@@ -985,8 +988,8 @@ for data_path in data_paths:
         test_events_samp = extract_event_samples(ecg_events_test)  # absolute samples (same raw)
     except Exception as e:
         print(f"  ERROR find_ecg_events deriving from MEG: {e}")
-        continue
-
+        return None
+    
     # -------------------------------------------------------------------------
     # 5) NEW: Fit ICA ONCE on MEG-only and select an ECG-like IC UNSUPERVISED
     # -------------------------------------------------------------------------
@@ -994,14 +997,14 @@ for data_path in data_paths:
         _ica, sources = fit_ica_and_get_sources(raw_meg_only)
     except Exception as e:
         print(f"  ERROR ICA fit: {e}")
-        continue
-
+        return None
+    
     unsup_ic, unsup_details, all_details_sorted = pick_best_ic_unsupervised(sources, sfreq)
     unsup_details["ic"] = int(unsup_ic)
-
+    
     # IC time course in sample space of raw_meg_only (same n_times as raw_meg_only)
     ecg_ica_unsup = sources[unsup_ic, :]
-
+    
     # -------------------------------------------------------------------------
     # 6) Detect ECG events from the ICA-derived IC trace
     #    Strategy:
@@ -1015,7 +1018,7 @@ for data_path in data_paths:
     try:
         info = mne.create_info(ch_names=["ICA_ECG"], sfreq=sfreq, ch_types=["ecg"])
         raw_ica_ecg = mne.io.RawArray(ecg_ica_unsup[np.newaxis, :], info, verbose=False)
-
+    
         ecg_events_ica, _, _, ecg_mne_from_ica = mne.preprocessing.find_ecg_events(
             raw_ica_ecg,
             ch_name="ICA_ECG",
@@ -1023,13 +1026,13 @@ for data_path in data_paths:
             verbose=False,
         )
         ecg_mne_from_ica = ecg_mne_from_ica[0]  # "MNE ECG trace" derived from ICA channel
-
+    
         ica_events_samp = extract_event_samples(ecg_events_ica)          # relative to RawArray (starts at 0)
         ica_events_samp_abs = ica_events_samp + raw.first_samp          # convert to absolute samples
     except Exception as e:
         print(f"  ERROR find_ecg_events on ICA-derived trace: {e}")
-        continue
-
+        return None
+    
     # -------------------------------------------------------------------------
     # 7) Length match for waveform comparisons (plots/correlation only)
     # -------------------------------------------------------------------------
@@ -1041,36 +1044,36 @@ for data_path in data_paths:
     )
     if n < int(round(2 * sfreq)):
         print("  Too short after length matching -> skipping")
-        continue
-
+        return None
+    
     ecg_raw_real = ecg_raw_real_full[:n]
     ecg_mne_from_ecg = ecg_mne_from_ecg[:n]
     ecg_mne_from_meg = ecg_mne_from_meg[:n]
     ecg_mne_from_ica = ecg_mne_from_ica[:n]
-
+    
     # -------------------------------------------------------------------------
     # 8) Waveform alignment (SECONDARY; for plots only)
     #    Baseline: align MNE-from-MEG trace to reference
     # -------------------------------------------------------------------------
     lag_mne = best_lag_via_xcorr(ecg_mne_from_ecg, ecg_mne_from_meg)
     ecg_mne_from_meg_aligned = shift_with_zeros(ecg_mne_from_meg, lag_mne)
-
+    
     r_mne_before, _ = pearsonr(ecg_mne_from_ecg, ecg_mne_from_meg)
     r_mne_after, _ = pearsonr(ecg_mne_from_ecg, ecg_mne_from_meg_aligned)
-
+    
     # -------------------------------------------------------------------------
     # 9) Waveform alignment for ICA-derived MNE ECG (SECONDARY; plots only)
     #    Optional sign flip for nicer overlay/correlation (benchmark only).
     # -------------------------------------------------------------------------
     if np.corrcoef(ecg_mne_from_ica, ecg_mne_from_ecg)[0, 1] < 0:
         ecg_mne_from_ica = -ecg_mne_from_ica  # benchmark-only sign flip
-
+    
     lag_ica = best_lag_via_xcorr(ecg_mne_from_ecg, ecg_mne_from_ica)
     ecg_mne_from_ica_aligned = shift_with_zeros(ecg_mne_from_ica, lag_ica)
-
+    
     r_ica_before, _ = pearsonr(ecg_mne_from_ecg, ecg_mne_from_ica)
     r_ica_after, _ = pearsonr(ecg_mne_from_ecg, ecg_mne_from_ica_aligned)
-
+    
     # -------------------------------------------------------------------------
     # 10) PRIMARY: Event matching metrics (NO lag correction)
     # -------------------------------------------------------------------------
@@ -1088,7 +1091,7 @@ for data_path in data_paths:
         unmatched_test=unmatched_test_mne,
         sfreq=sfreq,
     )
-
+    
     # ICA-derived events vs reference
     matched_ref_ica, matched_test_ica, unmatched_ref_ica, unmatched_test_ica = match_events_one_to_one(
         ref_samp=ref_events_samp,
@@ -1103,17 +1106,17 @@ for data_path in data_paths:
         unmatched_test=unmatched_test_ica,
         sfreq=sfreq,
     )
-
+    
     duration_sec = n / sfreq
     fp_per_min_mne = metrics_mne["FP"] / (duration_sec / 60.0) if duration_sec > 0 else np.nan
     fp_per_min_ica = metrics_ica["FP"] / (duration_sec / 60.0) if duration_sec > 0 else np.nan
-
+    
     # -------------------------------------------------------------------------
     # 11) Figures
     # -------------------------------------------------------------------------
     n_plot = min(n, int(round(PLOT_SECONDS * sfreq)))
     t = np.arange(n_plot) / sfreq
-
+    
     fig_path_baseline = os.path.join(OUTPUT_DIR, f"{subject_id}_pub_MNEfromMEG.png")
     make_publication_figure(
         out_png=fig_path_baseline,
@@ -1131,7 +1134,7 @@ for data_path in data_paths:
         first_samp=raw.first_samp,
         test_label="Test: MNE-from-MEG",
     )
-
+    
     fig_path_ica = os.path.join(OUTPUT_DIR, f"{subject_id}_pub_ICAunsup.png")
     make_publication_figure(
         out_png=fig_path_ica,
@@ -1149,17 +1152,17 @@ for data_path in data_paths:
         first_samp=raw.first_samp,
         test_label=f"Test: ICA-unsup (IC{unsup_ic})",
     )
-
+    
     # ICA ranking + diagnostics
     rank_png = os.path.join(OUTPUT_DIR, f"{subject_id}_ICAunsup_ranking.png")
     diag_png = os.path.join(OUTPUT_DIR, f"{subject_id}_ICAunsup_diag_IC{unsup_ic}.png")
-
+    
     try:
         plot_unsup_ic_ranking(rank_png, subject_id, all_details_sorted, topk=UNSUP_SCORE_TOPK_PLOT)
     except Exception as e:
         print(f"  WARNING: could not write ICA ranking plot: {e}")
         rank_png = ""
-
+    
     try:
         plot_unsup_ic_diagnostics(
             diag_png,
@@ -1171,23 +1174,23 @@ for data_path in data_paths:
     except Exception as e:
         print(f"  WARNING: could not write ICA diagnostics plot: {e}")
         diag_png = ""
-
+    
     # -------------------------------------------------------------------------
     # 12) Store summary row (baseline + ICA)
     # -------------------------------------------------------------------------
-    rows.append({
+    result = {
         "subject": subject_id,
         "file": str(data_path),
         "sfreq_hz": sfreq,
         "duration_sec": duration_sec,
         "ecg_channel": ecg_ch_name,
-
+    
         # Baseline waveform (secondary)
         "baseline_waveform_lag_samples": lag_mne,
         "baseline_waveform_lag_sec": lag_mne / sfreq,
         "baseline_r_waveform_before": r_mne_before,
         "baseline_r_waveform_after": r_mne_after,
-
+    
         # Baseline event metrics (primary)
         "baseline_match_tol_ms": 1e3 * MATCH_TOL_SEC,
         "baseline_TP": metrics_mne["TP"],
@@ -1204,14 +1207,14 @@ for data_path in data_paths:
         "baseline_jitter_median_abs_ms": metrics_mne["jitter_median_abs_ms"],
         "baseline_jitter_p95_abs_ms": metrics_mne["jitter_p95_abs_ms"],
         "baseline_pubgrade_figure": fig_path_baseline,
-
+    
         # ICA waveform (secondary)
         "ica_unsup_ic": unsup_ic,
         "ica_waveform_lag_samples": lag_ica,
         "ica_waveform_lag_sec": lag_ica / sfreq,
         "ica_r_waveform_before": r_ica_before,
         "ica_r_waveform_after": r_ica_after,
-
+    
         # ICA event metrics (primary)
         "ica_match_tol_ms": 1e3 * MATCH_TOL_SEC,
         "ica_TP": metrics_ica["TP"],
@@ -1227,7 +1230,7 @@ for data_path in data_paths:
         "ica_jitter_mae_ms": metrics_ica["jitter_mae_ms"],
         "ica_jitter_median_abs_ms": metrics_ica["jitter_median_abs_ms"],
         "ica_jitter_p95_abs_ms": metrics_ica["jitter_p95_abs_ms"],
-
+    
         # ICA unsupervised score components
         "ica_unsup_score": unsup_details["score"],
         "ica_unsup_bpm_est": unsup_details["bpm_est"],
@@ -1241,13 +1244,13 @@ for data_path in data_paths:
         "ica_unsup_spike_rate_per_min": unsup_details["spike_rate_per_min"],
         "ica_unsup_frac_absz_above_thr": unsup_details["frac_absz_above_thr"],
         "ica_unsup_n_spikes": unsup_details["n_spikes"],
-
+    
         # Figure paths
         "ica_pubgrade_figure": fig_path_ica,
         "ica_score_ranking_plot": rank_png,
         "ica_diagnostics_plot": diag_png,
-    })
-
+    }
+    
     print(
         f"  Done | baseline(MNE-from-MEG): F1={metrics_mne['f1']:.3f}, miss={metrics_mne['miss_rate']:.3f}, "
         f"jMAE={metrics_mne['jitter_mae_ms']:.2f}ms, FP/min={fp_per_min_mne:.2f} | "
@@ -1255,8 +1258,17 @@ for data_path in data_paths:
         f"jMAE={metrics_ica['jitter_mae_ms']:.2f}ms, FP/min={fp_per_min_ica:.2f} | "
         f"ICA score={unsup_details['score']:.3f}, bpm≈{unsup_details['bpm_est']:.1f}"
     )
+    return result
+    
 
+# Run processing (serial or parallel)
+if N_JOBS == 1:
+    rows = [r for r in (process_file(p) for p in data_paths) if r is not None]
+else:
+    rows = Parallel(n_jobs=N_JOBS)(delayed(process_file)(p) for p in data_paths)
+    rows = [r for r in rows if r is not None]
 
+    
 # =============================================================================
 # SAVE CSV SUMMARY
 # =============================================================================
