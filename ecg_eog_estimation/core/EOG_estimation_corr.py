@@ -49,6 +49,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+from joblib import Parallel, delayed
 from scipy.signal import correlate, find_peaks, welch
 from scipy.stats import pearsonr, kurtosis, skew
 
@@ -64,6 +65,9 @@ OUTPUT_DIR = "/Users/karelo/Development/datasets/ds_small/derivatives/eog_compar
 
 # Seconds shown in each plot
 PLOT_SECONDS = 60
+
+# Parallel processing: set >1 to enable joblib across files
+N_JOBS = 1
 
 # Band-pass used for "blink-sensitive" content (applied to reference and proxies)
 EOG_L_FREQ = 1.0
@@ -1010,7 +1014,6 @@ def plot_methods_overlay_meg_only(
 # =============================================================================
 # MAIN
 # =============================================================================
-results = []
 
 # Discover files to process (FIF + CTF)
 fif_files = [
@@ -1027,10 +1030,10 @@ data_paths = sorted(fif_files + ctf_files)
 
 print(f"Found {len(data_paths)} FIF/CTF files")
 
-for data_path in data_paths:
+def process_file(data_path: Path):
     subject_id = data_path.stem
     print(f"\nProcessing {subject_id}")
-
+    
     # -------------------------------------------------------------------------
     # Step 1) Load FIF
     # -------------------------------------------------------------------------
@@ -1041,13 +1044,13 @@ for data_path in data_paths:
             raw = mne.io.read_raw_ctf(data_path, preload=True, verbose=False)
         else:
             print(f"  Unsupported file format: {data_path}")
-            continue
+            return None
     except Exception as e:
         print(f"  ERROR reading file: {e}")
-        continue
-
+        return None
+    
     sfreq = float(raw.info["sfreq"])
-
+    
     # -------------------------------------------------------------------------
     # Step 2) Check whether a real EOG channel exists
     #   - If yes: benchmark mode (compute correlations/align to real EOG)
@@ -1055,11 +1058,11 @@ for data_path in data_paths:
     # -------------------------------------------------------------------------
     eog_idx = pick_prefer_vertical_eog(raw)
     has_real_eog = eog_idx >= 0
-
+    
     eog_ch_name = ""
     eog_raw_real = None
     eog_ref_proc = None
-
+    
     if has_real_eog:
         # Extract the real EOG trace and process it (band-pass + z)
         eog_ch_name = raw.ch_names[eog_idx]
@@ -1067,26 +1070,26 @@ for data_path in data_paths:
         eog_ref_proc = process_eog_trace(eog_raw_real, sfreq, EOG_L_FREQ, EOG_H_FREQ)
     else:
         print("  No real EOG channel -> MEG-only fallback mode (plots: Global PCA, Frontal PCA, ICA unsupervised).")
-
+    
     # -------------------------------------------------------------------------
     # Step 3) Create MEG-only Raw (always needed)
     # -------------------------------------------------------------------------
     raw_meg_only = raw.copy().pick_types(meg=True, eeg=False, eog=False, ecg=False, stim=False)
-
+    
     # Determine a common length for signals and operations
     if has_real_eog:
         n_total = min(len(eog_raw_real), len(eog_ref_proc), raw_meg_only.n_times)
     else:
         n_total = raw_meg_only.n_times
-
+    
     if n_total < int(round(5 * sfreq)):
         print("  Too short -> skipping")
-        continue
-
+        return None
+    
     if has_real_eog:
         eog_raw_real = eog_raw_real[:n_total]
         eog_ref_proc = eog_ref_proc[:n_total]
-
+    
     # -------------------------------------------------------------------------
     # Step 4) Global PCA proxy (MEG-only)
     # -------------------------------------------------------------------------
@@ -1095,8 +1098,8 @@ for data_path in data_paths:
         syn_pca_all_proc = process_eog_trace(syn_pca_all_raw, sfreq, EOG_L_FREQ, EOG_H_FREQ)[:n_total]
     except Exception as e:
         print(f"  ERROR Global PCA: {e}")
-        continue
-
+        return None
+    
     # -------------------------------------------------------------------------
     # Step 5) Frontal PCA unsupervised proxy (MEG-only)
     #   - Needed always for MEG-only plots
@@ -1111,7 +1114,7 @@ for data_path in data_paths:
         print(f"  WARNING Frontal PCA unsupervised failed: {e}")
         syn_pca_front_unsup_raw = None
         syn_pca_front_unsup_proc = None
-
+    
     # -------------------------------------------------------------------------
     # Step 6) If we are in benchmark mode, compute Frontal PCA supervised
     # -------------------------------------------------------------------------
@@ -1121,8 +1124,8 @@ for data_path in data_paths:
             syn_pca_front_sup_proc = process_eog_trace(syn_pca_front_sup_raw, sfreq, EOG_L_FREQ, EOG_H_FREQ)[:n_total]
         except Exception as e:
             print(f"  ERROR Frontal PCA supervised: {e}")
-            continue
-
+            return None
+    
     # -------------------------------------------------------------------------
     # Step 7) ICA: fit ONCE and extract sources
     # -------------------------------------------------------------------------
@@ -1130,21 +1133,21 @@ for data_path in data_paths:
         sources = fit_ica_sources_once(raw_meg_only)
     except Exception as e:
         print(f"  ERROR ICA fit: {e}")
-        continue
-
+        return None
+    
     # -------------------------------------------------------------------------
     # Step 8) ICA supervised selection (benchmark only)
     # -------------------------------------------------------------------------
     if has_real_eog:
         sup_ic, sup_abs_corr = pick_best_ic_supervised_from_sources(sources, eog_ref_proc)
         syn_ica_sup_raw = sources[sup_ic, :n_total]
-
+    
         # Benchmark-only sign stabilization: make it correlate positively with real EOG reference
         if np.corrcoef(syn_ica_sup_raw, eog_ref_proc)[0, 1] < 0:
             syn_ica_sup_raw = -syn_ica_sup_raw
-
+    
         syn_ica_sup_proc = process_eog_trace(syn_ica_sup_raw, sfreq, EOG_L_FREQ, EOG_H_FREQ)[:n_total]
-
+    
     # -------------------------------------------------------------------------
     # Step 9) ICA unsupervised selection (MEG-only)
     # -------------------------------------------------------------------------
@@ -1155,15 +1158,15 @@ for data_path in data_paths:
         fixed_ic=ICA_UNSUP_FIXED_IC,
     )
     syn_ica_unsup_raw = sources[unsup_ic, :n_total]
-
+    
     # Apply MEG-only sign convention (no real EOG is used here)
     if UNSUP_SIGN_MODE == "frontal_proxy" and syn_pca_front_unsup_proc is not None:
         syn_ica_unsup_raw = apply_unsup_sign_convention_frontal_proxy(syn_ica_unsup_raw, syn_pca_front_unsup_proc)
     else:
         syn_ica_unsup_raw = apply_unsup_sign_convention_peak_polarity(syn_ica_unsup_raw, sfreq)
-
+    
     syn_ica_unsup_proc = process_eog_trace(syn_ica_unsup_raw, sfreq, EOG_L_FREQ, EOG_H_FREQ)[:n_total]
-
+    
     # Collect unsupervised diagnostics into a unified dict for plots/CSV
     extra_info_common = dict(
         ica_unsup_best_ic=unsup_ic,
@@ -1175,7 +1178,7 @@ for data_path in data_paths:
         ica_unsup_selection_mode=unsup_details.get("selection_mode", ICA_UNSUP_MODE),
         ica_unsup_sign_mode=UNSUP_SIGN_MODE,
     )
-
+    
     # -------------------------------------------------------------------------
     # Step 10) MEG-only mode plotting + CSV row
     # -------------------------------------------------------------------------
@@ -1185,19 +1188,19 @@ for data_path in data_paths:
             # but the user asked explicitly: "Global PCA, Frontal PCA, ICA unsupervised".
             # So here we enforce a fallback: use global PCA as frontal proxy (clearly labeled).
             syn_pca_front_unsup_proc = syn_pca_all_proc.copy()
-
+    
         n_plot = min(n_total, int(round(PLOT_SECONDS * sfreq)))
         t = np.arange(n_plot) / sfreq
-
+    
         traces_meg_only = dict(
             pca_all_proc=syn_pca_all_proc,
             pca_frontal_unsup_proc=syn_pca_front_unsup_proc,
             ica_unsup_proc=syn_ica_unsup_proc,
         )
-
+    
         stacked_png = os.path.join(OUTPUT_DIR, f"{subject_id}_MEGonly_stacked_GlobalPCA_FrontalPCA_ICAunsup.png")
         overlay_png = os.path.join(OUTPUT_DIR, f"{subject_id}_MEGonly_overlay_GlobalPCA_FrontalPCA_ICAunsup.png")
-
+    
         plot_methods_stacked_meg_only(
             out_png=stacked_png,
             t=t,
@@ -1206,7 +1209,7 @@ for data_path in data_paths:
             sfreq=sfreq,
             extra_info=extra_info_common,
         )
-
+    
         plot_methods_overlay_meg_only(
             out_png=overlay_png,
             t=t,
@@ -1214,29 +1217,28 @@ for data_path in data_paths:
             subject_id=subject_id,
             extra_info=extra_info_common,
         )
-
+    
         # Save MEG-only results row (no reference correlations available)
-        results.append(
-            dict(
+        return dict(
                 subject=subject_id,
                 file=str(data_path),
                 sfreq_hz=sfreq,
                 n_samples=n_total,
                 has_real_eog=False,
                 eog_channel="",
-
+    
                 # Global PCA (MEG-only) — no benchmark correlations
                 pca_all_corr_before=np.nan,
                 pca_all_corr_after=np.nan,
                 pca_all_lag_samples=np.nan,
                 pca_all_lag_seconds=np.nan,
-
+    
                 # Frontal PCA supervised — not computed
                 pca_frontal_sup_corr_before=np.nan,
                 pca_frontal_sup_corr_after=np.nan,
                 pca_frontal_sup_lag_samples=np.nan,
                 pca_frontal_sup_lag_seconds=np.nan,
-
+    
                 # ICA supervised — not computed
                 ica_sup_best_ic=np.nan,
                 ica_sup_best_ic_abs_corr=np.nan,
@@ -1244,7 +1246,7 @@ for data_path in data_paths:
                 ica_sup_corr_after=np.nan,
                 ica_sup_lag_samples=np.nan,
                 ica_sup_lag_seconds=np.nan,
-
+    
                 # ICA unsupervised — always computed (MEG-only)
                 ica_unsup_mode=ICA_UNSUP_MODE,
                 ica_unsup_fixed_ic=ICA_UNSUP_FIXED_IC if ICA_UNSUP_MODE == "fixed" else np.nan,
@@ -1261,84 +1263,83 @@ for data_path in data_paths:
                 ica_unsup_corr_after=np.nan,
                 ica_unsup_lag_samples=np.nan,
                 ica_unsup_lag_seconds=np.nan,
-
+    
                 stacked_plot=stacked_png,
                 overlay_plot=overlay_png,
             )
-        )
-
+    
         print(
             f"  Done (MEG-only) | "
             f"GlobalPCA processed | "
             f"FrontalPCA({FRONTAL_PCA_UNSUPERVISED_MODE}) processed | "
             f"ICA UNSUP IC={unsup_ic} (mode={ICA_UNSUP_MODE}, sign={UNSUP_SIGN_MODE}, score={unsup_details.get('score', np.nan):.3f})"
         )
-        continue
-
+        return None
+    
     # -------------------------------------------------------------------------
     # Step 11) BENCHMARK MODE: compute alignments + correlations to real EOG
     # -------------------------------------------------------------------------
-
+    
     # A) Global PCA alignment/correlation
     lag_pca_all = best_lag_via_xcorr(eog_ref_proc, syn_pca_all_proc)
     syn_pca_all_aligned = shift_with_zeros(syn_pca_all_proc, lag_pca_all)
     r_pca_all_before, _ = pearsonr(eog_ref_proc, syn_pca_all_proc)
     r_pca_all_after, _ = pearsonr(eog_ref_proc, syn_pca_all_aligned)
-
+    
     # B) Frontal PCA supervised alignment/correlation
     lag_pca_front_sup = best_lag_via_xcorr(eog_ref_proc, syn_pca_front_sup_proc)
     syn_pca_front_sup_aligned = shift_with_zeros(syn_pca_front_sup_proc, lag_pca_front_sup)
     r_pca_front_sup_before, _ = pearsonr(eog_ref_proc, syn_pca_front_sup_proc)
     r_pca_front_sup_after, _ = pearsonr(eog_ref_proc, syn_pca_front_sup_aligned)
-
+    
     # C) ICA supervised alignment/correlation
     lag_ica_sup = best_lag_via_xcorr(eog_ref_proc, syn_ica_sup_proc)
     syn_ica_sup_aligned = shift_with_zeros(syn_ica_sup_proc, lag_ica_sup)
     r_ica_sup_before, _ = pearsonr(eog_ref_proc, syn_ica_sup_proc)
     r_ica_sup_after, _ = pearsonr(eog_ref_proc, syn_ica_sup_aligned)
-
+    
     # D) ICA unsupervised alignment/correlation (benchmark-only alignment)
     lag_ica_unsup = best_lag_via_xcorr(eog_ref_proc, syn_ica_unsup_proc)
     syn_ica_unsup_aligned = shift_with_zeros(syn_ica_unsup_proc, lag_ica_unsup)
     r_ica_unsup_before, _ = pearsonr(eog_ref_proc, syn_ica_unsup_proc)
     r_ica_unsup_after, _ = pearsonr(eog_ref_proc, syn_ica_unsup_aligned)
-
+    
     # -------------------------------------------------------------------------
     # Step 12) BENCHMARK MODE plots (6 stacked + overlay)
     # -------------------------------------------------------------------------
     n_plot = min(n_total, int(round(PLOT_SECONDS * sfreq)))
     t = np.arange(n_plot) / sfreq
-
+    
     traces_benchmark = dict(
         pca_all_aligned=syn_pca_all_aligned,
         pca_frontal_sup_aligned=syn_pca_front_sup_aligned,
         ica_sup_aligned=syn_ica_sup_aligned,
         ica_unsup_aligned=syn_ica_unsup_aligned,
     )
-
+    
     lag_info = dict(
         pca_all=lag_pca_all,
         pca_frontal_sup=lag_pca_front_sup,
         ica_sup=lag_ica_sup,
         ica_unsup=lag_ica_unsup,
     )
-
+    
     corr_info = dict(
         pca_all=r_pca_all_after,
         pca_frontal_sup=r_pca_front_sup_after,
         ica_sup=r_ica_sup_after,
         ica_unsup=r_ica_unsup_after,
     )
-
+    
     extra_info_benchmark = dict(
         ica_sup_best_ic=sup_ic,
         ica_sup_abs_corr=sup_abs_corr,
         **extra_info_common,
     )
-
+    
     stacked_png = os.path.join(OUTPUT_DIR, f"{subject_id}_BENCH_stacked_methods_sup_unsup.png")
     overlay_png = os.path.join(OUTPUT_DIR, f"{subject_id}_BENCH_overlay_methods_sup_unsup.png")
-
+    
     plot_methods_stacked_benchmark(
         out_png=stacked_png,
         t=t,
@@ -1351,7 +1352,7 @@ for data_path in data_paths:
         corr_info=corr_info,
         extra_info=extra_info_benchmark,
     )
-
+    
     plot_methods_overlay_benchmark(
         out_png=overlay_png,
         t=t,
@@ -1360,31 +1361,30 @@ for data_path in data_paths:
         subject_id=subject_id,
         corr_info=corr_info,
     )
-
+    
     # -------------------------------------------------------------------------
     # Step 13) BENCHMARK MODE: Save results row (includes correlations)
     # -------------------------------------------------------------------------
-    results.append(
-        dict(
+    result = dict(
             subject=subject_id,
             file=str(data_path),
             sfreq_hz=sfreq,
             n_samples=n_total,
             has_real_eog=True,
             eog_channel=eog_ch_name,
-
+    
             # Global PCA
             pca_all_corr_before=r_pca_all_before,
             pca_all_corr_after=r_pca_all_after,
             pca_all_lag_samples=lag_pca_all,
             pca_all_lag_seconds=lag_pca_all / sfreq,
-
+    
             # Supervised frontal PCA
             pca_frontal_sup_corr_before=r_pca_front_sup_before,
             pca_frontal_sup_corr_after=r_pca_front_sup_after,
             pca_frontal_sup_lag_samples=lag_pca_front_sup,
             pca_frontal_sup_lag_seconds=lag_pca_front_sup / sfreq,
-
+    
             # ICA supervised
             ica_sup_best_ic=sup_ic,
             ica_sup_best_ic_abs_corr=sup_abs_corr,
@@ -1392,7 +1392,7 @@ for data_path in data_paths:
             ica_sup_corr_after=r_ica_sup_after,
             ica_sup_lag_samples=lag_ica_sup,
             ica_sup_lag_seconds=lag_ica_sup / sfreq,
-
+    
             # ICA unsupervised
             ica_unsup_mode=ICA_UNSUP_MODE,
             ica_unsup_fixed_ic=ICA_UNSUP_FIXED_IC if ICA_UNSUP_MODE == "fixed" else np.nan,
@@ -1409,12 +1409,11 @@ for data_path in data_paths:
             ica_unsup_corr_after=r_ica_unsup_after,
             ica_unsup_lag_samples=lag_ica_unsup,
             ica_unsup_lag_seconds=lag_ica_unsup / sfreq,
-
+    
             stacked_plot=stacked_png,
             overlay_plot=overlay_png,
         )
-    )
-
+    
     print(
         f"  Done (benchmark) | EOG={eog_ch_name} | "
         f"GlobalPCA r_after={r_pca_all_after:.3f} | "
@@ -1422,6 +1421,14 @@ for data_path in data_paths:
         f"ICA SUP r_after={r_ica_sup_after:.3f} (IC={sup_ic}) | "
         f"ICA UNSUP r_after={r_ica_unsup_after:.3f} (IC={unsup_ic}, mode={ICA_UNSUP_MODE}, sign={UNSUP_SIGN_MODE})"
     )
+    return result
+
+# Run processing (serial or parallel)
+if N_JOBS == 1:
+    results = [r for r in (process_file(p) for p in data_paths) if r is not None]
+else:
+    results = Parallel(n_jobs=N_JOBS)(delayed(process_file)(p) for p in data_paths)
+    results = [r for r in results if r is not None]
 
 # =============================================================================
 # SAVE CSV SUMMARY

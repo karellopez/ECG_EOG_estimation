@@ -58,6 +58,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+from joblib import Parallel, delayed
 from scipy.signal import correlate, find_peaks
 from scipy.stats import pearsonr, kurtosis
 
@@ -74,6 +75,9 @@ OUTPUT_DIR = "/Users/karelo/Development/datasets/ds_small/derivatives/ecg_result
 
 # Seconds to show in plots (time axis)
 PLOT_SECONDS = 20
+
+# Parallel processing: set >1 to enable joblib across files
+N_JOBS = 1
 
 
 # --------------------------
@@ -726,7 +730,6 @@ def plot_overlay_meg_only(
 # =============================================================================
 # MAIN
 # =============================================================================
-results = []
 
 # Find all MEG FIF/CTF files under DATASET_ROOT (excluding derivatives and git folders)
 fif_files = [
@@ -743,10 +746,10 @@ data_paths = sorted(fif_files + ctf_files)
 
 print(f"Found {len(data_paths)} FIF/CTF files")
 
-for data_path in data_paths:
+def process_file(data_path: Path):
     subject_id = data_path.stem
     print(f"\nProcessing {subject_id}")
-
+    
     # -------------------------------------------------------------------------
     # 1) Load data
     # -------------------------------------------------------------------------
@@ -757,13 +760,13 @@ for data_path in data_paths:
             raw = mne.io.read_raw_ctf(data_path, preload=True, verbose=False)
         else:
             print(f"  Unsupported file format: {data_path}")
-            continue
+            return None
     except Exception as e:
         print(f"  ERROR reading file: {e}")
-        continue
-
+        return None
+    
     sfreq = float(raw.info["sfreq"])
-
+    
     # -------------------------------------------------------------------------
     # 2) Determine whether we have a REAL ECG channel
     #    - If yes, we can run benchmarking (reference + supervised).
@@ -771,17 +774,17 @@ for data_path in data_paths:
     # -------------------------------------------------------------------------
     ecg_picks = mne.pick_types(raw.info, ecg=True)
     has_ecg = len(ecg_picks) > 0
-
+    
     ecg_ch_name = ""
     ecg_raw_real = None
     ecg_ref_mne = None
-
+    
     if has_ecg:
         # Grab first ECG channel (you could extend this if multiple ECG channels exist)
         ecg_idx = int(ecg_picks[0])
         ecg_ch_name = raw.ch_names[ecg_idx]
         ecg_raw_real = raw.get_data(picks=[ecg_idx])[0]
-
+    
         # Build the reference ECG proxy from real ECG via find_ecg_events(return_ecg=True)
         try:
             _, _, _, ecg_ref_mne = mne.preprocessing.find_ecg_events(
@@ -793,15 +796,15 @@ for data_path in data_paths:
             ecg_ref_mne = ecg_ref_mne[0]
         except Exception as e:
             print(f"  ERROR find_ecg_events using real ECG: {e}")
-            continue
+            return None
     else:
         print("  No real ECG channel found -> running MEG-only ICA UNSUPERVISED mode.")
-
+    
     # -------------------------------------------------------------------------
     # 3) Build MEG-only raw (this is the common path for baseline + ICA)
     # -------------------------------------------------------------------------
     raw_meg_only = raw.copy().pick_types(meg=True, eeg=False, eog=False, ecg=False, stim=False)
-
+    
     # -------------------------------------------------------------------------
     # 4) Baseline ECG proxy from MEG using MNE's approach
     # -------------------------------------------------------------------------
@@ -815,8 +818,8 @@ for data_path in data_paths:
         ecg_mne_from_meg = ecg_mne_from_meg[0]
     except Exception as e:
         print(f"  ERROR find_ecg_events deriving ECG from MEG: {e}")
-        continue
-
+        return None
+    
     # -------------------------------------------------------------------------
     # 5) Decide the number of samples to analyze (length matching)
     # -------------------------------------------------------------------------
@@ -826,17 +829,17 @@ for data_path in data_paths:
     else:
         # In MEG-only mode there is no real ECG or reference trace
         n = min(len(ecg_mne_from_meg), raw_meg_only.n_times)
-
+    
     if n < int(round(5 * sfreq)):
         print("  Too short -> skipping")
-        continue
-
+        return None
+    
     # Crop signals to n samples for consistent operations
     ecg_mne_from_meg = ecg_mne_from_meg[:n]
     if has_ecg:
         ecg_raw_real = ecg_raw_real[:n]
         ecg_ref_mne = ecg_ref_mne[:n]
-
+    
     # -------------------------------------------------------------------------
     # 6) Fit ICA once (MEG-only), then select unsupervised (and supervised if ECG exists)
     # -------------------------------------------------------------------------
@@ -844,27 +847,27 @@ for data_path in data_paths:
         ica, sources = fit_ica_and_get_sources(raw_meg_only)
     except Exception as e:
         print(f"  ERROR ICA fit: {e}")
-        continue
-
+        return None
+    
     # Unsupervised selection is always possible (MEG-only)
     unsup_ic, unsup_details, _all_details_sorted = pick_best_ic_unsupervised(sources, sfreq)
     ecg_ica_unsup = sources[unsup_ic, :n]
-
+    
     # Optional MEG-only sign stabilization (purely for plot readability):
     # Make the larger-magnitude side positive so spikes look consistent.
     if np.abs(np.min(ecg_ica_unsup)) > np.abs(np.max(ecg_ica_unsup)):
         ecg_ica_unsup = -ecg_ica_unsup
-
+    
     # -------------------------------------------------------------------------
     # 7) MEG-only mode: plots + row + continue (skip supervised/ref computations)
     # -------------------------------------------------------------------------
     if not has_ecg:
         n_plot = min(n, int(round(PLOT_SECONDS * sfreq)))
         t = np.arange(n_plot) / sfreq
-
+    
         stacked_png = os.path.join(OUTPUT_DIR, f"{subject_id}_MEGonly_stacked_MNEfromMEG_vs_ICAunsup.png")
         overlay_png = os.path.join(OUTPUT_DIR, f"{subject_id}_MEGonly_overlay_MNEfromMEG_vs_ICAunsup.png")
-
+    
         plot_stacked_meg_only(
             out_png=stacked_png,
             t=t,
@@ -875,7 +878,7 @@ for data_path in data_paths:
             unsup_ic=unsup_ic,
             unsup_details=unsup_details,
         )
-
+    
         plot_overlay_meg_only(
             out_png=overlay_png,
             t=t,
@@ -885,35 +888,34 @@ for data_path in data_paths:
             unsup_ic=unsup_ic,
             unsup_details=unsup_details,
         )
-
+    
         # (Optional) detect ECG events on the IC trace, just as an informative field
         try:
             ev_rel, _ = detect_ecg_events_from_1d_trace(ecg_ica_unsup, sfreq)
             ica_unsup_n_events_detected = int(len(ev_rel))
         except Exception:
             ica_unsup_n_events_detected = 0
-
-        results.append(
-            dict(
+    
+        return dict(
                 subject=subject_id,
                 file=str(data_path),
                 sfreq_hz=sfreq,
                 n_samples=n,
                 ecg_channel="",
-
+    
                 # Benchmark metrics not available
                 mne_meg_corr_before=np.nan,
                 mne_meg_corr_after=np.nan,
                 mne_meg_lag_samples=np.nan,
                 mne_meg_lag_seconds=np.nan,
-
+    
                 ica_sup_best_ic=np.nan,
                 ica_sup_best_ic_abs_corr=np.nan,
                 ica_sup_corr_before=np.nan,
                 ica_sup_corr_after=np.nan,
                 ica_sup_lag_samples=np.nan,
                 ica_sup_lag_seconds=np.nan,
-
+    
                 # Unsupervised diagnostics available
                 ica_unsup_best_ic=unsup_ic,
                 ica_unsup_score=unsup_details["score"],
@@ -929,25 +931,24 @@ for data_path in data_paths:
                 ica_unsup_frac_absz_above_thr=unsup_details["frac_absz_above_thr"],
                 ica_unsup_n_spikes=unsup_details["n_spikes"],
                 ica_unsup_n_events_detected=ica_unsup_n_events_detected,
-
+    
                 # Correlation to reference not applicable
                 ica_unsup_corr_before=np.nan,
                 ica_unsup_corr_after=np.nan,
                 ica_unsup_lag_samples=np.nan,
                 ica_unsup_lag_seconds=np.nan,
-
+    
                 stacked_plot=stacked_png,
                 overlay_plot=overlay_png,
             )
-        )
-
+    
         print(
             f"  Done (MEG-only) | ICA-unsup IC={unsup_ic}, score={unsup_details['score']:.3f}, "
             f"bpm≈{unsup_details['bpm_est']:.1f}, spikes/min={unsup_details['spike_rate_per_min']:.1f}, "
             f"events_detected={ica_unsup_n_events_detected}"
         )
-        continue
-
+        return None
+    
     # -------------------------------------------------------------------------
     # 8) ECG-present mode (benchmarking): compute baseline alignment/corr
     # -------------------------------------------------------------------------
@@ -955,22 +956,22 @@ for data_path in data_paths:
     ecg_mne_meg_aligned = shift_with_zeros(ecg_mne_from_meg, lag_mne)
     r_mne_before, _ = pearsonr(ecg_ref_mne, ecg_mne_from_meg)
     r_mne_after, _ = pearsonr(ecg_ref_mne, ecg_mne_meg_aligned)
-
+    
     # -------------------------------------------------------------------------
     # 9) ICA SUPERVISED (benchmarking only): pick IC with max abs corr to reference
     # -------------------------------------------------------------------------
     sup_ic, sup_abs_corr = pick_best_ic_supervised(sources, ecg_ref_mne)
     ecg_ica_sup = sources[sup_ic, :n]
-
+    
     # Sign stabilize to match reference for fair plotting/correlation
     if np.corrcoef(ecg_ica_sup, ecg_ref_mne)[0, 1] < 0:
         ecg_ica_sup = -ecg_ica_sup
-
+    
     lag_sup = best_lag_via_xcorr(ecg_ref_mne, ecg_ica_sup)
     ecg_ica_sup_aligned = shift_with_zeros(ecg_ica_sup, lag_sup)
     r_sup_before, _ = pearsonr(ecg_ref_mne, ecg_ica_sup)
     r_sup_after, _ = pearsonr(ecg_ref_mne, ecg_ica_sup_aligned)
-
+    
     # -------------------------------------------------------------------------
     # 10) ICA UNSUPERVISED (benchmarking overlay only):
     #     IMPORTANT: selection used NO ECG, but for plotting we can sign-stabilize
@@ -980,21 +981,21 @@ for data_path in data_paths:
     # here we do a benchmark-only sign stabilization to reference.
     if np.corrcoef(ecg_ica_unsup, ecg_ref_mne)[0, 1] < 0:
         ecg_ica_unsup = -ecg_ica_unsup
-
+    
     lag_unsup = best_lag_via_xcorr(ecg_ref_mne, ecg_ica_unsup)
     ecg_ica_unsup_aligned = shift_with_zeros(ecg_ica_unsup, lag_unsup)
     r_unsup_before, _ = pearsonr(ecg_ref_mne, ecg_ica_unsup)
     r_unsup_after, _ = pearsonr(ecg_ref_mne, ecg_ica_unsup_aligned)
-
+    
     # -------------------------------------------------------------------------
     # 11) Plotting (benchmark mode)
     # -------------------------------------------------------------------------
     n_plot = min(n, int(round(PLOT_SECONDS * sfreq)))
     t = np.arange(n_plot) / sfreq
-
+    
     stacked_png = os.path.join(OUTPUT_DIR, f"{subject_id}_stacked_ref_mne_sup_unsup.png")
     overlay_png = os.path.join(OUTPUT_DIR, f"{subject_id}_overlay_ref_mne_sup_unsup.png")
-
+    
     plot_stacked_ecg_present(
         out_png=stacked_png,
         t=t,
@@ -1016,7 +1017,7 @@ for data_path in data_paths:
         unsup_ic=unsup_ic,
         unsup_details=unsup_details,
     )
-
+    
     plot_overlay_ecg_present(
         out_png=overlay_png,
         t=t,
@@ -1029,30 +1030,29 @@ for data_path in data_paths:
         r_sup_after=r_sup_after,
         r_unsup_after=r_unsup_after,
     )
-
+    
     # -------------------------------------------------------------------------
     # 12) Save results (benchmark mode)
     # -------------------------------------------------------------------------
-    results.append(
-        dict(
+    result = dict(
             subject=subject_id,
             file=str(data_path),
             sfreq_hz=sfreq,
             n_samples=n,
             ecg_channel=ecg_ch_name,
-
+    
             mne_meg_corr_before=r_mne_before,
             mne_meg_corr_after=r_mne_after,
             mne_meg_lag_samples=lag_mne,
             mne_meg_lag_seconds=lag_mne / sfreq,
-
+    
             ica_sup_best_ic=sup_ic,
             ica_sup_best_ic_abs_corr=sup_abs_corr,
             ica_sup_corr_before=r_sup_before,
             ica_sup_corr_after=r_sup_after,
             ica_sup_lag_samples=lag_sup,
             ica_sup_lag_seconds=lag_sup / sfreq,
-
+    
             ica_unsup_best_ic=unsup_ic,
             ica_unsup_score=unsup_details["score"],
             ica_unsup_bpm_est=unsup_details["bpm_est"],
@@ -1066,17 +1066,16 @@ for data_path in data_paths:
             ica_unsup_spike_rate_per_min=unsup_details["spike_rate_per_min"],
             ica_unsup_frac_absz_above_thr=unsup_details["frac_absz_above_thr"],
             ica_unsup_n_spikes=unsup_details["n_spikes"],
-
+    
             ica_unsup_corr_before=r_unsup_before,
             ica_unsup_corr_after=r_unsup_after,
             ica_unsup_lag_samples=lag_unsup,
             ica_unsup_lag_seconds=lag_unsup / sfreq,
-
+    
             stacked_plot=stacked_png,
             overlay_plot=overlay_png,
         )
-    )
-
+    
     print(
         f"  Done | ECG={ecg_ch_name} | "
         f"MNE r_after={r_mne_after:.3f} | "
@@ -1084,6 +1083,15 @@ for data_path in data_paths:
         f"ICA-unsup r_after={r_unsup_after:.3f} (IC={unsup_ic}, score={unsup_details['score']:.3f}, bpm≈{unsup_details['bpm_est']:.1f}) | "
         f"unsup spikes/min={unsup_details['spike_rate_per_min']:.1f}"
     )
+    return result
+
+
+# Run processing (serial or parallel)
+if N_JOBS == 1:
+    results = [r for r in (process_file(p) for p in data_paths) if r is not None]
+else:
+    results = Parallel(n_jobs=N_JOBS)(delayed(process_file)(p) for p in data_paths)
+    results = [r for r in results if r is not None]
 
 
 # =============================================================================

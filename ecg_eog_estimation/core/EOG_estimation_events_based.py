@@ -61,6 +61,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+from joblib import Parallel, delayed
 from scipy.signal import correlate, find_peaks, welch
 from scipy.stats import pearsonr, kurtosis, skew
 
@@ -73,6 +74,9 @@ DATASET_ROOT = "/Users/karelo/Development/datasets/ds_small"
 OUTPUT_DIR = "/Users/karelo/Development/datasets/ds_small/derivatives/eog_event_validation_full_v7style"
 
 PLOT_SECONDS = 60
+
+# Parallel processing: set >1 to enable joblib across files
+N_JOBS = 1
 
 # Band-pass used for blink-sensitive content (applied to reference and proxies for waveform comparisons)
 EOG_L_FREQ = 1.0
@@ -961,7 +965,6 @@ def plot_event_overlay(
 # =============================================================================
 # MAIN
 # =============================================================================
-rows: List[Dict] = []
 
 fif_files = [
     p
@@ -977,10 +980,10 @@ data_paths = sorted(fif_files + ctf_files)
 
 print(f"Found {len(data_paths)} FIF/CTF files")
 
-for data_path in data_paths:
+def process_file(data_path: Path):
     subject_id = data_path.stem
     print(f"\nProcessing {subject_id}")
-
+    
     # 1) Load
     try:
         if data_path.suffix == ".fif":
@@ -989,44 +992,44 @@ for data_path in data_paths:
             raw = mne.io.read_raw_ctf(data_path, preload=True, verbose=False)
         else:
             print(f"  Unsupported file format: {data_path}")
-            continue
+            return None
     except Exception as e:
         print(f"  ERROR reading file: {e}")
-        continue
-
+        return None
+    
     sfreq = float(raw.info["sfreq"])
-
+    
     # 2) Real EOG?
     eog_idx = pick_prefer_vertical_eog(raw)
     has_real_eog = eog_idx >= 0
-
+    
     if not has_real_eog:
         print("  No real EOG channel -> skipping (this script is event-validation vs real EOG).")
-        continue
-
+        return None
+    
     eog_ch_name = raw.ch_names[eog_idx]
     eog_raw_real = raw.get_data(picks=[eog_idx])[0]
     eog_ref_proc = process_trace_bandpass_z(eog_raw_real, sfreq, EOG_L_FREQ, EOG_H_FREQ)
-
+    
     # Ground-truth events from REAL EOG
     try:
         eog_events_ref = mne.preprocessing.find_eog_events(raw, ch_name=eog_ch_name, verbose=False)
         ref_events_abs = extract_event_samples(eog_events_ref)
     except Exception as e:
         print(f"  ERROR find_eog_events on real EOG: {e}")
-        continue
-
+        return None
+    
     # 3) MEG-only raw
     raw_meg = raw.copy().pick_types(meg=True, eeg=False, eog=False, ecg=False, stim=False)
-
+    
     # common length
     n_total = min(len(eog_ref_proc), raw_meg.n_times)
     if n_total < int(round(10 * sfreq)):
         print("  Too short -> skipping")
-        continue
-
+        return None
+    
     eog_ref_proc = eog_ref_proc[:n_total]
-
+    
     # 4) Global PCA (MEG-only)
     try:
         pca_all_raw = build_synth_eog_pca_all(raw_meg)[:n_total]
@@ -1034,8 +1037,8 @@ for data_path in data_paths:
         _, pca_all_events_abs = events_from_trace_via_mne_find_eog(pca_all_raw[:n_total], sfreq, raw.first_samp)
     except Exception as e:
         print(f"  ERROR Global PCA: {e}")
-        continue
-
+        return None
+    
     # 5) Frontal PCA UNSUP (MEG-only)
     try:
         pca_front_unsup_raw = build_synth_eog_pca_frontal_unsupervised(raw_meg)[:n_total]
@@ -1046,7 +1049,7 @@ for data_path in data_paths:
         pca_front_unsup_raw = None
         pca_front_unsup_proc = None
         pca_front_unsup_events_abs = np.array([], dtype=int)
-
+    
     # 6) Supervised Frontal PCA (benchmark extra)
     try:
         pca_front_sup_raw = build_synth_eog_pca_frontal_supervised(raw_meg, eog_ref_proc)[:n_total]
@@ -1054,59 +1057,59 @@ for data_path in data_paths:
         _, pca_front_sup_events_abs = events_from_trace_via_mne_find_eog(pca_front_sup_raw[:n_total], sfreq, raw.first_samp)
     except Exception as e:
         print(f"  ERROR Frontal PCA supervised: {e}")
-        continue
-
+        return None
+    
     # 7) ICA sources ONCE
     try:
         sources = fit_ica_sources_once(raw_meg)[:, :n_total]
     except Exception as e:
         print(f"  ERROR ICA fit: {e}")
-        continue
-
+        return None
+    
     # 8) ICA supervised (benchmark extra)
     try:
         ica_sup_ic, ica_sup_abs_corr = pick_best_ic_supervised_from_sources(sources, eog_ref_proc)
         ica_sup_raw = sources[ica_sup_ic, :n_total]
-
+    
         # sign stabilization (benchmark-only): positive corr to real EOG
         if np.corrcoef(ica_sup_raw, eog_ref_proc)[0, 1] < 0:
             ica_sup_raw = -ica_sup_raw
-
+    
         ica_sup_proc = process_trace_bandpass_z(ica_sup_raw, sfreq, EOG_L_FREQ, EOG_H_FREQ)[:n_total]
         _, ica_sup_events_abs = events_from_trace_via_mne_find_eog(ica_sup_raw, sfreq, raw.first_samp)
     except Exception as e:
         print(f"  ERROR ICA supervised: {e}")
-        continue
-
+        return None
+    
     # 9) ICA unsupervised (MEG-only)
     try:
         ica_unsup_ic, unsup_details = pick_best_ic_unsupervised_from_sources(
             sources, sfreq=sfreq, mode=ICA_UNSUP_MODE, fixed_ic=ICA_UNSUP_FIXED_IC
         )
         ica_unsup_raw = sources[ica_unsup_ic, :n_total]
-
+    
         # MEG-only sign convention
         if UNSUP_SIGN_MODE == "frontal_proxy" and pca_front_unsup_proc is not None:
             ica_unsup_raw = apply_unsup_sign_convention_frontal_proxy(ica_unsup_raw, pca_front_unsup_proc)
         else:
             ica_unsup_raw = apply_unsup_sign_convention_peak_polarity(ica_unsup_raw, sfreq)
-
+    
         ica_unsup_proc = process_trace_bandpass_z(ica_unsup_raw, sfreq, EOG_L_FREQ, EOG_H_FREQ)[:n_total]
         _, ica_unsup_events_abs = events_from_trace_via_mne_find_eog(ica_unsup_raw, sfreq, raw.first_samp)
     except Exception as e:
         print(f"  ERROR ICA unsupervised: {e}")
-        continue
-
-    # =============================================================================
+        return None
+    
+# =============================================================================
     # EVENT METRICS (PRIMARY)
-    # =============================================================================
+# =============================================================================
     duration_sec = n_total / sfreq
-
+    
     # PCA global
     mref_g, mtest_g, uref_g, utest_g = match_events_one_to_one(ref_events_abs, pca_all_events_abs, sfreq, MATCH_TOL_SEC)
     met_g = compute_detection_metrics(mref_g, mtest_g, uref_g, utest_g, sfreq)
     fpmin_g = met_g["FP"] / (duration_sec / 60.0) if duration_sec > 0 else np.nan
-
+    
     # PCA frontal unsup (if available; else NaN metrics)
     if pca_front_unsup_raw is not None:
         mref_fu, mtest_fu, uref_fu, utest_fu = match_events_one_to_one(ref_events_abs, pca_front_unsup_events_abs, sfreq, MATCH_TOL_SEC)
@@ -1118,35 +1121,35 @@ for data_path in data_paths:
                       jitter_median_abs_ms=np.nan, jitter_p95_abs_ms=np.nan, jitter_sec_signed=np.array([]))
         fpmin_fu = np.nan
         mref_fu = mtest_fu = np.array([], dtype=int)
-
+    
     # PCA frontal supervised
     mref_fs, mtest_fs, uref_fs, utest_fs = match_events_one_to_one(ref_events_abs, pca_front_sup_events_abs, sfreq, MATCH_TOL_SEC)
     met_fs = compute_detection_metrics(mref_fs, mtest_fs, uref_fs, utest_fs, sfreq)
     fpmin_fs = met_fs["FP"] / (duration_sec / 60.0) if duration_sec > 0 else np.nan
-
+    
     # ICA supervised
     mref_is, mtest_is, uref_is, utest_is = match_events_one_to_one(ref_events_abs, ica_sup_events_abs, sfreq, MATCH_TOL_SEC)
     met_is = compute_detection_metrics(mref_is, mtest_is, uref_is, utest_is, sfreq)
     fpmin_is = met_is["FP"] / (duration_sec / 60.0) if duration_sec > 0 else np.nan
-
+    
     # ICA unsupervised
     mref_iu, mtest_iu, uref_iu, utest_iu = match_events_one_to_one(ref_events_abs, ica_unsup_events_abs, sfreq, MATCH_TOL_SEC)
     met_iu = compute_detection_metrics(mref_iu, mtest_iu, uref_iu, utest_iu, sfreq)
     fpmin_iu = met_iu["FP"] / (duration_sec / 60.0) if duration_sec > 0 else np.nan
-
-    # =============================================================================
+    
+# =============================================================================
     # WAVEFORM LAG + CORR (SECONDARY, like your v7)
-    # =============================================================================
+# =============================================================================
     def corr_with_lag(refx, testx):
         r0, _ = pearsonr(refx, testx)
         lag = best_lag_via_xcorr(refx, testx)
         aligned = shift_with_zeros(testx, lag)
         r1, _ = pearsonr(refx, aligned)
         return r0, r1, lag, aligned
-
+    
     # Global PCA
     r_g0, r_g1, lag_g, pca_all_aligned = corr_with_lag(eog_ref_proc, pca_all_proc)
-
+    
     # Frontal PCA unsup
     if pca_front_unsup_proc is not None:
         r_fu0, r_fu1, lag_fu, pca_front_unsup_aligned = corr_with_lag(eog_ref_proc, pca_front_unsup_proc)
@@ -1154,19 +1157,19 @@ for data_path in data_paths:
         r_fu0 = r_fu1 = np.nan
         lag_fu = 0
         pca_front_unsup_aligned = np.zeros_like(eog_ref_proc)
-
+    
     # Frontal PCA supervised
     r_fs0, r_fs1, lag_fs, pca_front_sup_aligned = corr_with_lag(eog_ref_proc, pca_front_sup_proc)
-
+    
     # ICA supervised
     r_is0, r_is1, lag_is, ica_sup_aligned = corr_with_lag(eog_ref_proc, ica_sup_proc)
-
+    
     # ICA unsupervised
     r_iu0, r_iu1, lag_iu, ica_unsup_aligned = corr_with_lag(eog_ref_proc, ica_unsup_proc)
-
-    # =============================================================================
+    
+# =============================================================================
     # PLOTS (event-aware)
-    # =============================================================================
+# =============================================================================
     # One figure per method (so you can compare directly)
     plot_event_overlay(
         out_png=os.path.join(OUTPUT_DIR, f"{subject_id}_EV_PCAglobal.png"),
@@ -1177,7 +1180,7 @@ for data_path in data_paths:
         metrics=met_g, label_test="Test: PCA global", match_tol_sec=MATCH_TOL_SEC,
         seconds=PLOT_SECONDS
     )
-
+    
     if pca_front_unsup_proc is not None:
         plot_event_overlay(
             out_png=os.path.join(OUTPUT_DIR, f"{subject_id}_EV_PCAfrontal_UNSUP.png"),
@@ -1188,7 +1191,7 @@ for data_path in data_paths:
             metrics=met_fu, label_test=f"Test: PCA frontal UNSUP ({FRONTAL_PCA_UNSUPERVISED_MODE})",
             match_tol_sec=MATCH_TOL_SEC, seconds=PLOT_SECONDS
         )
-
+    
     plot_event_overlay(
         out_png=os.path.join(OUTPUT_DIR, f"{subject_id}_EV_PCAfrontal_SUP.png"),
         subject_id=subject_id, sfreq=sfreq, first_samp=raw.first_samp,
@@ -1198,7 +1201,7 @@ for data_path in data_paths:
         metrics=met_fs, label_test="Test: PCA frontal SUP (corr-ranked sensors)",
         match_tol_sec=MATCH_TOL_SEC, seconds=PLOT_SECONDS
     )
-
+    
     plot_event_overlay(
         out_png=os.path.join(OUTPUT_DIR, f"{subject_id}_EV_ICAsup_IC{ica_sup_ic}.png"),
         subject_id=subject_id, sfreq=sfreq, first_samp=raw.first_samp,
@@ -1208,7 +1211,7 @@ for data_path in data_paths:
         metrics=met_is, label_test=f"Test: ICA SUP (IC{ica_sup_ic})",
         match_tol_sec=MATCH_TOL_SEC, seconds=PLOT_SECONDS
     )
-
+    
     plot_event_overlay(
         out_png=os.path.join(OUTPUT_DIR, f"{subject_id}_EV_ICAunsup_IC{ica_unsup_ic}.png"),
         subject_id=subject_id, sfreq=sfreq, first_samp=raw.first_samp,
@@ -1218,18 +1221,18 @@ for data_path in data_paths:
         metrics=met_iu, label_test=f"Test: ICA UNSUP ({ICA_UNSUP_MODE}; IC{ica_unsup_ic}; sign={UNSUP_SIGN_MODE})",
         match_tol_sec=MATCH_TOL_SEC, seconds=PLOT_SECONDS
     )
-
-    # =============================================================================
+    
+# =============================================================================
     # CSV ROW
-    # =============================================================================
-    rows.append(dict(
+# =============================================================================
+    result = dict(
         subject=subject_id,
         file=str(data_path),
         sfreq_hz=sfreq,
         duration_sec=duration_sec,
         eog_channel=eog_ch_name,
         match_tol_ms=1e3 * MATCH_TOL_SEC,
-
+    
         # Waveform (secondary)
         pca_global_r_before=r_g0, pca_global_r_after=r_g1, pca_global_lag_samples=lag_g, pca_global_lag_sec=lag_g/sfreq,
         pca_frontal_unsup_mode=FRONTAL_PCA_UNSUPERVISED_MODE,
@@ -1237,7 +1240,7 @@ for data_path in data_paths:
         pca_frontal_sup_r_before=r_fs0, pca_frontal_sup_r_after=r_fs1, pca_frontal_sup_lag_samples=lag_fs, pca_frontal_sup_lag_sec=lag_fs/sfreq,
         ica_sup_ic=ica_sup_ic, ica_sup_abs_corr=ica_sup_abs_corr,
         ica_sup_r_before=r_is0, ica_sup_r_after=r_is1, ica_sup_lag_samples=lag_is, ica_sup_lag_sec=lag_is/sfreq,
-
+    
         ica_unsup_mode=ICA_UNSUP_MODE,
         ica_unsup_fixed_ic=ICA_UNSUP_FIXED_IC if ICA_UNSUP_MODE == "fixed" else np.nan,
         ica_unsup_sign_mode=UNSUP_SIGN_MODE,
@@ -1250,38 +1253,38 @@ for data_path in data_paths:
         ica_unsup_pos_rate_per_min=unsup_details.get("pos_rate_per_min", np.nan),
         ica_unsup_neg_rate_per_min=unsup_details.get("neg_rate_per_min", np.nan),
         ica_unsup_r_before=r_iu0, ica_unsup_r_after=r_iu1, ica_unsup_lag_samples=lag_iu, ica_unsup_lag_sec=lag_iu/sfreq,
-
+    
         # Event metrics (primary) — PCA global
         pca_global_TP=met_g["TP"], pca_global_FP=met_g["FP"], pca_global_FN=met_g["FN"],
         pca_global_precision=met_g["precision"], pca_global_recall=met_g["recall"], pca_global_f1=met_g["f1"],
         pca_global_miss_rate=met_g["miss_rate"], pca_global_fp_per_min=fpmin_g,
         pca_global_jitter_mae_ms=met_g["jitter_mae_ms"], pca_global_jitter_p95_ms=met_g["jitter_p95_abs_ms"],
-
+    
         # Event metrics — PCA frontal unsup
         pca_frontal_unsup_TP=met_fu["TP"], pca_frontal_unsup_FP=met_fu["FP"], pca_frontal_unsup_FN=met_fu["FN"],
         pca_frontal_unsup_precision=met_fu["precision"], pca_frontal_unsup_recall=met_fu["recall"], pca_frontal_unsup_f1=met_fu["f1"],
         pca_frontal_unsup_miss_rate=met_fu["miss_rate"], pca_frontal_unsup_fp_per_min=fpmin_fu,
         pca_frontal_unsup_jitter_mae_ms=met_fu["jitter_mae_ms"], pca_frontal_unsup_jitter_p95_ms=met_fu["jitter_p95_abs_ms"],
-
+    
         # Event metrics — PCA frontal sup
         pca_frontal_sup_TP=met_fs["TP"], pca_frontal_sup_FP=met_fs["FP"], pca_frontal_sup_FN=met_fs["FN"],
         pca_frontal_sup_precision=met_fs["precision"], pca_frontal_sup_recall=met_fs["recall"], pca_frontal_sup_f1=met_fs["f1"],
         pca_frontal_sup_miss_rate=met_fs["miss_rate"], pca_frontal_sup_fp_per_min=fpmin_fs,
         pca_frontal_sup_jitter_mae_ms=met_fs["jitter_mae_ms"], pca_frontal_sup_jitter_p95_ms=met_fs["jitter_p95_abs_ms"],
-
+    
         # Event metrics — ICA sup
         ica_sup_TP=met_is["TP"], ica_sup_FP=met_is["FP"], ica_sup_FN=met_is["FN"],
         ica_sup_precision=met_is["precision"], ica_sup_recall=met_is["recall"], ica_sup_f1=met_is["f1"],
         ica_sup_miss_rate=met_is["miss_rate"], ica_sup_fp_per_min=fpmin_is,
         ica_sup_jitter_mae_ms=met_is["jitter_mae_ms"], ica_sup_jitter_p95_ms=met_is["jitter_p95_abs_ms"],
-
+    
         # Event metrics — ICA unsup
         ica_unsup_TP=met_iu["TP"], ica_unsup_FP=met_iu["FP"], ica_unsup_FN=met_iu["FN"],
         ica_unsup_precision=met_iu["precision"], ica_unsup_recall=met_iu["recall"], ica_unsup_f1=met_iu["f1"],
         ica_unsup_miss_rate=met_iu["miss_rate"], ica_unsup_fp_per_min=fpmin_iu,
         ica_unsup_jitter_mae_ms=met_iu["jitter_mae_ms"], ica_unsup_jitter_p95_ms=met_iu["jitter_p95_abs_ms"],
-    ))
-
+    )
+    
     print(
         f"  Done | Events F1: PCAglob={met_g['f1']:.3f} | "
         f"PCAfrontUNSUP={met_fu['f1'] if np.isfinite(met_fu['f1']) else np.nan} | "
@@ -1289,8 +1292,17 @@ for data_path in data_paths:
         f"ICAsup={met_is['f1']:.3f} | "
         f"ICAunsup={met_iu['f1']:.3f} (IC{ica_unsup_ic}, mode={ICA_UNSUP_MODE}, sign={UNSUP_SIGN_MODE})"
     )
+    return result
+    
 
+# Run processing (serial or parallel)
+if N_JOBS == 1:
+    rows = [r for r in (process_file(p) for p in data_paths) if r is not None]
+else:
+    rows = Parallel(n_jobs=N_JOBS)(delayed(process_file)(p) for p in data_paths)
+    rows = [r for r in rows if r is not None]
 
+    
 # =============================================================================
 # SAVE CSV SUMMARY
 # =============================================================================
