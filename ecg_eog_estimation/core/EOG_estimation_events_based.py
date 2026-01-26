@@ -62,7 +62,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from scipy.signal import correlate, find_peaks, welch
-from scipy.stats import pearsonr, kurtosis
+from scipy.stats import pearsonr, kurtosis, skew
 
 
 # =============================================================================
@@ -141,7 +141,8 @@ W_EOG_KURT = 0.20
 W_EOG_RATE = 0.20
 W_EOG_POS_SPIKE = 0.30
 W_EOG_NEG_PENALTY = 0.10
-W_EOG_BANDPOWER = 0.20
+W_EOG_BANDPOWER = 0.10
+W_EOG_SKEW = 0.10
 
 # Spectral shape heuristics: blinks are low-frequency dominant
 EOG_LOW_BAND = (0.5, 4.0)
@@ -683,6 +684,7 @@ def blink_likeness_score(ic: np.ndarray, sfreq: float) -> Dict:
       - peak rate plausibility (prominence-based)
       - explicit positive-spike reward
       - negative-spike penalty
+      - positive skewness (blink polarity)
 
     Returns a dict with total score and diagnostics.
     """
@@ -734,6 +736,11 @@ def blink_likeness_score(ic: np.ndarray, sfreq: float) -> Dict:
     band = eog_bandpower_ratio_score(z, sfreq)
     p_band = band["p_band"]
 
+    # (5) Positive skewness (reward positive-going blink transients)
+    sk = float(skew(z, bias=False)) if len(z) > 10 else 0.0
+    p_skew = float(np.tanh(sk / 2.0))
+    p_skew = max(0.0, p_skew)
+
     # Weighted combination
     score = (
         W_EOG_KURT * p_kurt
@@ -741,6 +748,7 @@ def blink_likeness_score(ic: np.ndarray, sfreq: float) -> Dict:
         + W_EOG_POS_SPIKE * p_pos
         + W_EOG_NEG_PENALTY * p_neg_penalty
         + W_EOG_BANDPOWER * p_band
+        + W_EOG_SKEW * p_skew
     )
 
     return dict(
@@ -750,8 +758,10 @@ def blink_likeness_score(ic: np.ndarray, sfreq: float) -> Dict:
         p_pos=float(p_pos),
         p_neg_penalty=float(p_neg_penalty),
         p_bandpower=float(p_band),
+        p_skew=float(p_skew),
         rate_per_min=float(rate),
         kurtosis=float(k),
+        skewness=float(sk),
         n_prom_peaks=int(len(peaks)),
         pos_rate_per_min=float(spike["pos_rate_per_min"]),
         neg_rate_per_min=float(spike["neg_rate_per_min"]),
