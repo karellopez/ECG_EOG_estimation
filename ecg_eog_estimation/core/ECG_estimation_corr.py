@@ -74,7 +74,7 @@ DATASET_ROOT = "/Users/karelo/Development/datasets/ds_small"
 OUTPUT_DIR = "/Users/karelo/Development/datasets/ds_small/derivatives/ecg_results_supervised_unsupervised_ica_v6"
 
 # Seconds to show in plots (time axis)
-PLOT_SECONDS = 20
+PLOT_SECONDS = 60
 
 # Parallel processing: set >1 to enable joblib across files
 N_JOBS = 1
@@ -107,7 +107,7 @@ HR_MAX_BPM = 180
 HR_BAND_HZ = (HR_MIN_BPM / 60.0, HR_MAX_BPM / 60.0)  # convert bpm -> Hz
 
 # Score only the first N seconds for speed/stability (set None to use full length)
-UNSUP_SCORE_SECONDS = 120
+UNSUP_SCORE_SECONDS = None
 
 # Peak detection parameters (run on abs(z))
 PEAK_MIN_DISTANCE_SEC = 0.30
