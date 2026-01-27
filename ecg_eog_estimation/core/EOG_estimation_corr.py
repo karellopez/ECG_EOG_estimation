@@ -64,7 +64,7 @@ DATASET_ROOT = "/Users/karelo/Development/datasets/ds_small"
 OUTPUT_DIR = "/Users/karelo/Development/datasets/ds_small/derivatives/eog_compare_methods_supervised_unsupervised_v7"
 
 # Seconds shown in each plot
-PLOT_SECONDS = 60
+PLOT_SECONDS = 100
 
 # Parallel processing: set >1 to enable joblib across files
 N_JOBS = 1
@@ -100,7 +100,7 @@ ICA_RANDOM_STATE = 97
 ICA_MAX_ITER = 1000
 
 # Score window for unsupervised ICA heuristics (None uses full data)
-UNSUP_SCORE_SECONDS = 120
+UNSUP_SCORE_SECONDS = None
 
 # Unsupervised ICA selection mode:
 #   "heuristic": choose IC by blink-likeness score
@@ -611,8 +611,8 @@ def eog_bandpower_ratio_score(
     if not np.any(low_mask) or not np.any(high_mask):
         return dict(p_band=0.0, bandpower_ratio=float("nan"))
 
-    low_power = float(np.trapz(psd[low_mask], freqs[low_mask]))
-    high_power = float(np.trapz(psd[high_mask], freqs[high_mask]))
+    low_power = float(np.trapezoid(psd[low_mask], freqs[low_mask]))
+    high_power = float(np.trapezoid(psd[high_mask], freqs[high_mask]))
     ratio = low_power / (high_power + 1e-12)
 
     log_ratio = np.log10(ratio + 1e-12)
