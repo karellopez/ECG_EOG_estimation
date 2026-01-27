@@ -82,7 +82,7 @@ DATASET_ROOT = "/Users/karelo/Development/datasets/ds_small"
 OUTPUT_DIR = "/Users/karelo/Development/datasets/ds_small/derivatives/ecg_results_event_validation_with_ica_unsup_v2"
 
 # Plot window in seconds for time series panels (A/B/C/D)
-PLOT_SECONDS = 20
+PLOT_SECONDS = 60
 
 # Parallel processing: set >1 to enable joblib across files
 N_JOBS = 1
@@ -111,7 +111,7 @@ HR_MAX_BPM = 180
 HR_BAND_HZ = (HR_MIN_BPM / 60.0, HR_MAX_BPM / 60.0)
 
 # Score on first N seconds (None uses full recording)
-UNSUP_SCORE_SECONDS = 120
+UNSUP_SCORE_SECONDS = None
 
 # Peak detection parameters used in ECG-like heuristics
 PEAK_MIN_DISTANCE_SEC = 0.30
