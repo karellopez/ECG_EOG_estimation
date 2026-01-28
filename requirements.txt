@@ -3,5 +3,4 @@ pandas
 matplotlib
 scikit-learn
 mne
-mne-icalabel
 joblib

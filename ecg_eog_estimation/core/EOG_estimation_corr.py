@@ -451,7 +451,7 @@ def build_synth_eog_pca_frontal_unsupervised(raw_meg: mne.io.BaseRaw) -> np.ndar
 # =============================================================================
 # HELPERS: ICA (FIT ONCE PER FILE)
 # =============================================================================
-def fit_ica_sources_once(raw_meg: mne.io.BaseRaw) -> tuple[mne.preprocessing.ICA, np.ndarray]:
+def fit_ica_sources_once(raw_meg: mne.io.BaseRaw) -> np.ndarray:
     """
     Fit ICA ONCE per file and return the sources matrix (n_ic, n_times).
 
@@ -481,39 +481,7 @@ def fit_ica_sources_once(raw_meg: mne.io.BaseRaw) -> tuple[mne.preprocessing.ICA
     if sources.size == 0:
         raise RuntimeError("ICA produced no sources.")
 
-    return ica, sources
-
-
-def label_ica_components(raw_meg: mne.io.BaseRaw, ica: mne.preprocessing.ICA) -> dict | None:
-    """
-    Run MNE-ICLabel to label ICA components.
-    """
-    try:
-        from mne_icalabel import label_components
-    except ImportError:
-        print("  WARNING: mne_icalabel is not installed; skipping ICLabel.")
-        return None
-
-    try:
-        return label_components(raw_meg, ica, method="iclabel")
-    except Exception as exc:
-        print(f"  WARNING: ICLabel failed: {exc}")
-        return None
-
-
-def summarize_iclabel(iclabel: dict | None, ic_idx: int) -> tuple[str, float]:
-    """
-    Extract label + confidence for a specific IC from ICLabel output.
-    """
-    if not iclabel:
-        return "unknown", float("nan")
-    labels = iclabel.get("labels")
-    proba = iclabel.get("y_pred_proba")
-    if labels is None or ic_idx >= len(labels):
-        return "unknown", float("nan")
-    label = labels[ic_idx]
-    conf = float(np.max(proba[ic_idx])) if isinstance(proba, np.ndarray) and ic_idx < proba.shape[0] else float("nan")
-    return str(label), conf
+    return sources
 
 
 def pick_best_ic_supervised_from_sources(sources: np.ndarray, eog_ref_proc: np.ndarray) -> tuple[int, float]:
@@ -1176,12 +1144,10 @@ def process_file(data_path: Path):
     # Step 7) ICA: fit ONCE and extract sources
     # -------------------------------------------------------------------------
     try:
-        ica, sources = fit_ica_sources_once(raw_meg_only)
+        sources = fit_ica_sources_once(raw_meg_only)
     except Exception as e:
         print(f"  ERROR ICA fit: {e}")
         return None
-
-    iclabel = label_ica_components(raw_meg_only, ica)
     
     # -------------------------------------------------------------------------
     # Step 8) ICA supervised selection (benchmark only)
@@ -1189,7 +1155,6 @@ def process_file(data_path: Path):
     if has_real_eog:
         sup_ic, sup_abs_corr = pick_best_ic_supervised_from_sources(sources, eog_ref_proc)
         syn_ica_sup_raw = sources[sup_ic, :n_total]
-        sup_label, sup_label_conf = summarize_iclabel(iclabel, sup_ic)
     
         # Benchmark-only sign stabilization: make it correlate positively with real EOG reference
         if np.corrcoef(syn_ica_sup_raw, eog_ref_proc)[0, 1] < 0:
@@ -1207,7 +1172,6 @@ def process_file(data_path: Path):
         fixed_ic=ICA_UNSUP_FIXED_IC,
     )
     syn_ica_unsup_raw = sources[unsup_ic, :n_total]
-    unsup_label, unsup_label_conf = summarize_iclabel(iclabel, unsup_ic)
     if unsup_details.get("flip_for_score", False):
         syn_ica_unsup_raw = -syn_ica_unsup_raw
     
@@ -1229,8 +1193,6 @@ def process_file(data_path: Path):
         ica_unsup_p_neg_penalty=unsup_details.get("p_neg_penalty", float("nan")),
         ica_unsup_selection_mode=unsup_details.get("selection_mode", ICA_UNSUP_MODE),
         ica_unsup_sign_mode=UNSUP_SIGN_MODE,
-        ica_unsup_iclabel_label=unsup_label,
-        ica_unsup_iclabel_confidence=unsup_label_conf,
     )
     
     # -------------------------------------------------------------------------
@@ -1313,8 +1275,6 @@ def process_file(data_path: Path):
                 ica_unsup_p_neg_penalty=unsup_details.get("p_neg_penalty", float("nan")),
                 ica_unsup_pos_rate_per_min=unsup_details.get("pos_rate_per_min", float("nan")),
                 ica_unsup_neg_rate_per_min=unsup_details.get("neg_rate_per_min", float("nan")),
-                ica_unsup_iclabel_label=unsup_label,
-                ica_unsup_iclabel_confidence=unsup_label_conf,
                 ica_unsup_corr_before=np.nan,
                 ica_unsup_corr_after=np.nan,
                 ica_unsup_lag_samples=np.nan,
@@ -1328,8 +1288,7 @@ def process_file(data_path: Path):
             f"  Done (MEG-only) | "
             f"GlobalPCA processed | "
             f"FrontalPCA({FRONTAL_PCA_UNSUPERVISED_MODE}) processed | "
-            f"ICA UNSUP IC={unsup_ic} (mode={ICA_UNSUP_MODE}, sign={UNSUP_SIGN_MODE}, "
-            f"score={unsup_details.get('score', np.nan):.3f}, ICLabel={unsup_label} (conf={unsup_label_conf:.2f}))"
+            f"ICA UNSUP IC={unsup_ic} (mode={ICA_UNSUP_MODE}, sign={UNSUP_SIGN_MODE}, score={unsup_details.get('score', np.nan):.3f})"
         )
         return None
     
@@ -1391,8 +1350,6 @@ def process_file(data_path: Path):
     extra_info_benchmark = dict(
         ica_sup_best_ic=sup_ic,
         ica_sup_abs_corr=sup_abs_corr,
-        ica_sup_iclabel_label=sup_label,
-        ica_sup_iclabel_confidence=sup_label_conf,
         **extra_info_common,
     )
     
@@ -1447,8 +1404,6 @@ def process_file(data_path: Path):
             # ICA supervised
             ica_sup_best_ic=sup_ic,
             ica_sup_best_ic_abs_corr=sup_abs_corr,
-            ica_sup_iclabel_label=sup_label,
-            ica_sup_iclabel_confidence=sup_label_conf,
             ica_sup_corr_before=r_ica_sup_before,
             ica_sup_corr_after=r_ica_sup_after,
             ica_sup_lag_samples=lag_ica_sup,
@@ -1466,8 +1421,6 @@ def process_file(data_path: Path):
             ica_unsup_p_neg_penalty=unsup_details.get("p_neg_penalty", float("nan")),
             ica_unsup_pos_rate_per_min=unsup_details.get("pos_rate_per_min", float("nan")),
             ica_unsup_neg_rate_per_min=unsup_details.get("neg_rate_per_min", float("nan")),
-            ica_unsup_iclabel_label=unsup_label,
-            ica_unsup_iclabel_confidence=unsup_label_conf,
             ica_unsup_corr_before=r_ica_unsup_before,
             ica_unsup_corr_after=r_ica_unsup_after,
             ica_unsup_lag_samples=lag_ica_unsup,
@@ -1482,8 +1435,7 @@ def process_file(data_path: Path):
         f"GlobalPCA r_after={r_pca_all_after:.3f} | "
         f"FrontalPCA SUP r_after={r_pca_front_sup_after:.3f} | "
         f"ICA SUP r_after={r_ica_sup_after:.3f} (IC={sup_ic}) | "
-        f"ICA UNSUP r_after={r_ica_unsup_after:.3f} (IC={unsup_ic}, mode={ICA_UNSUP_MODE}, sign={UNSUP_SIGN_MODE}) | "
-        f"ICLabel sup={sup_label} (conf={sup_label_conf:.2f}) unsup={unsup_label} (conf={unsup_label_conf:.2f})"
+        f"ICA UNSUP r_after={r_ica_unsup_after:.3f} (IC={unsup_ic}, mode={ICA_UNSUP_MODE}, sign={UNSUP_SIGN_MODE})"
     )
     return result
 
