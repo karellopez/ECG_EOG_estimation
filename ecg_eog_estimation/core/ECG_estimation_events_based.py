@@ -581,40 +581,6 @@ def fit_ica_and_get_sources(raw_meg: mne.io.BaseRaw) -> Tuple[mne.preprocessing.
     return ica, sources
 
 
-def label_ica_components(raw_meg: mne.io.BaseRaw, ica: mne.preprocessing.ICA) -> Optional[Dict]:
-    """
-    Run MNE-ICLabel to label ICA components.
-
-    Returns the label_components output dict or None if labeling fails.
-    """
-    try:
-        from mne_icalabel import label_components
-    except ImportError:
-        print("  WARNING: mne_icalabel is not installed; skipping ICLabel.")
-        return None
-
-    try:
-        return label_components(raw_meg, ica, method="iclabel")
-    except Exception as exc:
-        print(f"  WARNING: ICLabel failed: {exc}")
-        return None
-
-
-def summarize_iclabel(iclabel: Optional[Dict], ic_idx: int) -> Tuple[str, float]:
-    """
-    Extract label + confidence for a specific IC from ICLabel output.
-    """
-    if not iclabel:
-        return "unknown", float("nan")
-    labels = iclabel.get("labels")
-    proba = iclabel.get("y_pred_proba")
-    if labels is None or ic_idx >= len(labels):
-        return "unknown", float("nan")
-    label = labels[ic_idx]
-    conf = float(np.max(proba[ic_idx])) if isinstance(proba, np.ndarray) and ic_idx < proba.shape[0] else float("nan")
-    return str(label), conf
-
-
 def pick_best_ic_unsupervised(sources: np.ndarray, sfreq: float) -> Tuple[int, Dict, List[Dict]]:
     """
     Score each IC and return:
@@ -1039,12 +1005,9 @@ def process_file(data_path: Path):
     except Exception as e:
         print(f"  ERROR ICA fit: {e}")
         return None
-
-    iclabel = label_ica_components(raw_meg_only, _ica)
     
     unsup_ic, unsup_details, all_details_sorted = pick_best_ic_unsupervised(sources, sfreq)
     unsup_details["ic"] = int(unsup_ic)
-    unsup_label, unsup_label_conf = summarize_iclabel(iclabel, unsup_ic)
     
     # IC time course in sample space of raw_meg_only (same n_times as raw_meg_only)
     ecg_ica_unsup = sources[unsup_ic, :]
@@ -1290,8 +1253,6 @@ def process_file(data_path: Path):
         "ica_unsup_spike_rate_per_min": unsup_details["spike_rate_per_min"],
         "ica_unsup_frac_absz_above_thr": unsup_details["frac_absz_above_thr"],
         "ica_unsup_n_spikes": unsup_details["n_spikes"],
-        "ica_iclabel_label": unsup_label,
-        "ica_iclabel_confidence": unsup_label_conf,
     
         # Figure paths
         "ica_pubgrade_figure": fig_path_ica,
@@ -1304,8 +1265,7 @@ def process_file(data_path: Path):
         f"jMAE={metrics_mne['jitter_mae_ms']:.2f}ms, FP/min={fp_per_min_mne:.2f} | "
         f"ICA-unsup(IC{unsup_ic}): F1={metrics_ica['f1']:.3f}, miss={metrics_ica['miss_rate']:.3f}, "
         f"jMAE={metrics_ica['jitter_mae_ms']:.2f}ms, FP/min={fp_per_min_ica:.2f} | "
-        f"ICA score={unsup_details['score']:.3f}, bpm≈{unsup_details['bpm_est']:.1f} | "
-        f"ICLabel={unsup_label} (conf={unsup_label_conf:.2f})"
+        f"ICA score={unsup_details['score']:.3f}, bpm≈{unsup_details['bpm_est']:.1f}"
     )
     return result
     
