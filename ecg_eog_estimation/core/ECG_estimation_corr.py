@@ -491,6 +491,38 @@ def fit_ica_and_get_sources(raw_meg: mne.io.BaseRaw) -> tuple[mne.preprocessing.
     return ica, sources
 
 
+def label_ica_components(raw_meg: mne.io.BaseRaw, ica: mne.preprocessing.ICA) -> dict | None:
+    """
+    Run MNE-ICLabel to label ICA components.
+    """
+    try:
+        from mne_icalabel import label_components
+    except ImportError:
+        print("  WARNING: mne_icalabel is not installed; skipping ICLabel.")
+        return None
+
+    try:
+        return label_components(raw_meg, ica, method="iclabel")
+    except Exception as exc:
+        print(f"  WARNING: ICLabel failed: {exc}")
+        return None
+
+
+def summarize_iclabel(iclabel: dict | None, ic_idx: int) -> tuple[str, float]:
+    """
+    Extract label + confidence for a specific IC from ICLabel output.
+    """
+    if not iclabel:
+        return "unknown", float("nan")
+    labels = iclabel.get("labels")
+    proba = iclabel.get("y_pred_proba")
+    if labels is None or ic_idx >= len(labels):
+        return "unknown", float("nan")
+    label = labels[ic_idx]
+    conf = float(np.max(proba[ic_idx])) if isinstance(proba, np.ndarray) and ic_idx < proba.shape[0] else float("nan")
+    return str(label), conf
+
+
 def pick_best_ic_supervised(sources: np.ndarray, ecg_ref: np.ndarray) -> tuple[int, float]:
     """
     SUPERVISED IC selection (benchmarking):
@@ -855,12 +887,15 @@ def process_file(data_path: Path):
     except Exception as e:
         print(f"  ERROR ICA fit: {e}")
         return None
+
+    iclabel = label_ica_components(raw_meg_only, ica)
     
     # Unsupervised selection is always possible (MEG-only)
     unsup_ic, unsup_details, _all_details_sorted = pick_best_ic_unsupervised(sources, sfreq)
     ecg_ica_unsup = sources[unsup_ic, :n]
     if unsup_details.get("flip_for_score", False):
         ecg_ica_unsup = -ecg_ica_unsup
+    unsup_label, unsup_label_conf = summarize_iclabel(iclabel, unsup_ic)
     
     # Optional MEG-only sign stabilization (purely for plot readability):
     # Make the larger-magnitude side positive so spikes look consistent.
@@ -940,6 +975,8 @@ def process_file(data_path: Path):
                 ica_unsup_frac_absz_above_thr=unsup_details["frac_absz_above_thr"],
                 ica_unsup_n_spikes=unsup_details["n_spikes"],
                 ica_unsup_n_events_detected=ica_unsup_n_events_detected,
+                ica_unsup_iclabel_label=unsup_label,
+                ica_unsup_iclabel_confidence=unsup_label_conf,
     
                 # Correlation to reference not applicable
                 ica_unsup_corr_before=np.nan,
@@ -954,7 +991,7 @@ def process_file(data_path: Path):
         print(
             f"  Done (MEG-only) | ICA-unsup IC={unsup_ic}, score={unsup_details['score']:.3f}, "
             f"bpm≈{unsup_details['bpm_est']:.1f}, spikes/min={unsup_details['spike_rate_per_min']:.1f}, "
-            f"events_detected={ica_unsup_n_events_detected}"
+            f"events_detected={ica_unsup_n_events_detected}, ICLabel={unsup_label} (conf={unsup_label_conf:.2f})"
         )
         return None
     
@@ -971,6 +1008,7 @@ def process_file(data_path: Path):
     # -------------------------------------------------------------------------
     sup_ic, sup_abs_corr = pick_best_ic_supervised(sources, ecg_ref_mne)
     ecg_ica_sup = sources[sup_ic, :n]
+    sup_label, sup_label_conf = summarize_iclabel(iclabel, sup_ic)
     
     # Sign stabilize to match reference for fair plotting/correlation
     if np.corrcoef(ecg_ica_sup, ecg_ref_mne)[0, 1] < 0:
@@ -1057,6 +1095,8 @@ def process_file(data_path: Path):
     
             ica_sup_best_ic=sup_ic,
             ica_sup_best_ic_abs_corr=sup_abs_corr,
+            ica_sup_iclabel_label=sup_label,
+            ica_sup_iclabel_confidence=sup_label_conf,
             ica_sup_corr_before=r_sup_before,
             ica_sup_corr_after=r_sup_after,
             ica_sup_lag_samples=lag_sup,
@@ -1075,6 +1115,8 @@ def process_file(data_path: Path):
             ica_unsup_spike_rate_per_min=unsup_details["spike_rate_per_min"],
             ica_unsup_frac_absz_above_thr=unsup_details["frac_absz_above_thr"],
             ica_unsup_n_spikes=unsup_details["n_spikes"],
+            ica_unsup_iclabel_label=unsup_label,
+            ica_unsup_iclabel_confidence=unsup_label_conf,
     
             ica_unsup_corr_before=r_unsup_before,
             ica_unsup_corr_after=r_unsup_after,
@@ -1090,7 +1132,8 @@ def process_file(data_path: Path):
         f"MNE r_after={r_mne_after:.3f} | "
         f"ICA-sup r_after={r_sup_after:.3f} (IC={sup_ic}) | "
         f"ICA-unsup r_after={r_unsup_after:.3f} (IC={unsup_ic}, score={unsup_details['score']:.3f}, bpm≈{unsup_details['bpm_est']:.1f}) | "
-        f"unsup spikes/min={unsup_details['spike_rate_per_min']:.1f}"
+        f"unsup spikes/min={unsup_details['spike_rate_per_min']:.1f} | "
+        f"ICLabel sup={sup_label} (conf={sup_label_conf:.2f}) unsup={unsup_label} (conf={unsup_label_conf:.2f})"
     )
     return result
 
