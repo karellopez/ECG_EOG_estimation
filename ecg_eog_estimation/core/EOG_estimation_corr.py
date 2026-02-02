@@ -20,13 +20,15 @@ When a REAL EOG channel exists (benchmark mode):
   4) Frontal PCA supervised                   [uses real EOG to rank sensors]
   5) ICA supervised                           [uses real EOG to select IC]
   6) ICA unsupervised                         [MEG-only selection + sign convention]
-  7) Multi PCA unsupervised                   [align global/frontal/ICA + PCA]
+  7) PCA proxy ICA adapted                    [frontal PCA proxy + ICA corr + score]
+  8) Multi PCA unsupervised                   [align global/frontal/ICA + PCA]
 
 When NO REAL EOG channel exists (MEG-only mode):
   1) Global PCA (MEG-only)
   2) Frontal PCA unsupervised
   3) ICA unsupervised
-  4) Multi PCA unsupervised
+  4) PCA proxy ICA adapted
+  5) Multi PCA unsupervised
 and we generate plots + CSV row with only MEG-only metrics (no correlations to real EOG).
 
 -------------------------------------------------------------------------------
@@ -828,6 +830,90 @@ def pick_best_ic_unsupervised_from_sources(
     return int(best_idx), best_details
 
 
+def pick_best_ic_pca_proxy_adapted(
+        sources: np.ndarray,
+        pca_proxy: np.ndarray,
+        sfreq: float,
+) -> tuple[int, dict]:
+    """
+    PCA-proxy ICA adapted selection.
+
+    Steps:
+      1) Compute abs correlation between each IC (and its flipped version) and the PCA proxy.
+      2) Compute blink-likeness score for each IC (and its flipped version).
+      3) Prefer a component that is strong on BOTH metrics. If the max-corr and max-score
+         components differ, fall back to a combined rank.
+
+    Returns:
+      (best_ic_index, details_dict)
+    """
+    n = min(sources.shape[1], len(pca_proxy))
+    if n < 10:
+        raise RuntimeError("PCA proxy too short for adapted ICA selection.")
+
+    proxy = pca_proxy[:n]
+    corrs = np.zeros(sources.shape[0], dtype=float)
+    corr_flips = np.zeros(sources.shape[0], dtype=bool)
+    scores = np.zeros(sources.shape[0], dtype=float)
+    score_flips = np.zeros(sources.shape[0], dtype=bool)
+    score_details = []
+
+    proxy0 = proxy - np.mean(proxy)
+    prox_sd = np.std(proxy0) + 1e-12
+
+    for i in range(sources.shape[0]):
+        ic = sources[i, :n]
+        ic0 = ic - np.mean(ic)
+        ic_sd = np.std(ic0) + 1e-12
+        r = float(np.dot(ic0, proxy0) / (len(proxy0) * ic_sd * prox_sd))
+        if not np.isfinite(r):
+            r = 0.0
+        corrs[i] = abs(r)
+        corr_flips[i] = r < 0
+
+        details_pos = blink_likeness_score(ic, sfreq)
+        details_neg = blink_likeness_score(-ic, sfreq)
+        if details_neg["score"] > details_pos["score"]:
+            details = details_neg
+            score_flips[i] = True
+        else:
+            details = details_pos
+            score_flips[i] = False
+        scores[i] = details["score"]
+        score_details.append(details)
+
+    best_corr_idx = int(np.argmax(corrs))
+    best_score_idx = int(np.argmax(scores))
+
+    if best_corr_idx == best_score_idx:
+        best_idx = best_corr_idx
+        selection_mode = "corr_and_score"
+    else:
+        corr_order = np.argsort(corrs)
+        score_order = np.argsort(scores)
+        corr_rank = np.empty_like(corr_order)
+        score_rank = np.empty_like(score_order)
+        corr_rank[corr_order] = np.arange(len(corr_order))
+        score_rank[score_order] = np.arange(len(score_order))
+        combined_rank = corr_rank + score_rank
+        best_idx = int(np.argmax(combined_rank))
+        selection_mode = "combined_rank"
+
+    details = dict(
+        selection_mode=selection_mode,
+        best_corr_ic=best_corr_idx,
+        best_corr=corrs[best_corr_idx],
+        best_score_ic=best_score_idx,
+        best_score=scores[best_score_idx],
+        chosen_corr=corrs[best_idx],
+        chosen_score=scores[best_idx],
+        flip_for_corr=bool(corr_flips[best_idx]),
+        flip_for_score=bool(score_flips[best_idx]),
+        **score_details[best_idx],
+    )
+    return best_idx, details
+
+
 # =============================================================================
 # MEG-only sign convention for UNSUPERVISED IC
 # =============================================================================
@@ -904,7 +990,7 @@ def plot_methods_stacked_benchmark(
         extra_info: dict,
 ):
     """
-    Create the 7-panel stacked figure used in benchmark mode.
+    Create the 8-panel stacked figure used in benchmark mode.
 
     Panels:
       1) Real EOG raw (z)
@@ -913,12 +999,13 @@ def plot_methods_stacked_benchmark(
       4) Frontal PCA supervised aligned
       5) ICA supervised aligned
       6) ICA unsupervised aligned (MEG-only selection + sign rule; benchmark-only alignment)
-      7) Multi PCA unsupervised aligned
+      7) PCA proxy ICA adapted aligned
+      8) Multi PCA unsupervised aligned
 
     The title includes compact diagnostics from unsupervised ICA scoring.
     """
     n_plot = len(t)
-    fig, axes = plt.subplots(7, 1, figsize=(14, 13.5), sharex=True)
+    fig, axes = plt.subplots(8, 1, figsize=(14, 15.5), sharex=True)
 
     axes[0].plot(t, safe_zscore(eog_raw_real[:n_plot]))
     axes[0].set_title("1) Real EOG channel (raw) [z-score]")
@@ -952,12 +1039,20 @@ def plot_methods_stacked_benchmark(
     )
     axes[5].set_ylabel("a.u.")
 
-    axes[6].plot(t, traces["multi_pca_unsup_aligned"][:n_plot])
+    axes[6].plot(t, traces["pca_proxy_ica_adapted_aligned"][:n_plot])
     axes[6].set_title(
-        f"7) Multi PCA UNSUPERVISED | lag={lag_info['multi_pca_unsup']} | r={corr_info['multi_pca_unsup']:.3f}"
+        f"7) PCA PROXY ICA ADAPTED (IC={extra_info['pca_proxy_ica_adapted_ic']}, "
+        f"corr={extra_info['pca_proxy_ica_adapted_corr']:.3f}, score={extra_info['pca_proxy_ica_adapted_score']:.3f}) | "
+        f"lag={lag_info['pca_proxy_ica_adapted']} | r={corr_info['pca_proxy_ica_adapted']:.3f}"
     )
     axes[6].set_ylabel("a.u.")
-    axes[6].set_xlabel("Time (s)")
+
+    axes[7].plot(t, traces["multi_pca_unsup_aligned"][:n_plot])
+    axes[7].set_title(
+        f"8) Multi PCA UNSUPERVISED | lag={lag_info['multi_pca_unsup']} | r={corr_info['multi_pca_unsup']:.3f}"
+    )
+    axes[7].set_ylabel("a.u.")
+    axes[7].set_xlabel("Time (s)")
 
     header_1 = f"{subject_id} | sfreq={sfreq:.2f} Hz | band={EOG_L_FREQ}-{EOG_H_FREQ} Hz"
     header_2 = (
@@ -987,6 +1082,7 @@ def plot_methods_overlay_benchmark(
       - supervised frontal PCA
       - ICA supervised
       - ICA unsupervised
+      - PCA proxy ICA adapted
       - Multi PCA unsupervised
     """
     n_plot = len(t)
@@ -998,6 +1094,8 @@ def plot_methods_overlay_benchmark(
              label=f"Frontal PCA SUP r={corr_info['pca_frontal_sup']:.3f}")
     plt.plot(t, traces["ica_sup_aligned"][:n_plot], label=f"ICA SUP r={corr_info['ica_sup']:.3f}")
     plt.plot(t, traces["ica_unsup_aligned"][:n_plot], label=f"ICA UNSUP r={corr_info['ica_unsup']:.3f}")
+    plt.plot(t, traces["pca_proxy_ica_adapted_aligned"][:n_plot],
+             label=f"PCA proxy ICA adapted r={corr_info['pca_proxy_ica_adapted']:.3f}")
     plt.plot(t, traces["multi_pca_unsup_aligned"][:n_plot], label=f"Multi PCA UNSUP r={corr_info['multi_pca_unsup']:.3f}")
 
     plt.legend()
@@ -1021,18 +1119,19 @@ def plot_methods_stacked_meg_only(
         extra_info: dict,
 ):
     """
-    4-panel stacked plot when no real EOG channel exists.
+    5-panel stacked plot when no real EOG channel exists.
 
     We show only MEG-only methods:
       1) Global PCA (processed)
       2) Frontal PCA unsupervised (processed)
       3) ICA unsupervised (processed)
-      4) Multi PCA unsupervised (processed)
+      4) PCA proxy ICA adapted (processed)
+      5) Multi PCA unsupervised (processed)
 
     There is no "reference", so we do not compute correlations to real EOG here.
     """
     n_plot = len(t)
-    fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
+    fig, axes = plt.subplots(5, 1, figsize=(14, 12), sharex=True)
 
     axes[0].plot(t, traces["pca_all_proc"][:n_plot])
     axes[0].set_title("1) Global PCA (MEG-only) processed (band-pass + z)")
@@ -1049,10 +1148,17 @@ def plot_methods_stacked_meg_only(
     )
     axes[2].set_ylabel("a.u.")
 
-    axes[3].plot(t, traces["multi_pca_unsup_proc"][:n_plot])
-    axes[3].set_title("4) Multi PCA UNSUPERVISED processed")
+    axes[3].plot(t, traces["pca_proxy_ica_adapted_proc"][:n_plot])
+    axes[3].set_title(
+        f"4) PCA PROXY ICA ADAPTED (IC={extra_info['pca_proxy_ica_adapted_ic']}, "
+        f"corr={extra_info['pca_proxy_ica_adapted_corr']:.3f}, score={extra_info['pca_proxy_ica_adapted_score']:.3f})"
+    )
     axes[3].set_ylabel("a.u.")
-    axes[3].set_xlabel("Time (s)")
+
+    axes[4].plot(t, traces["multi_pca_unsup_proc"][:n_plot])
+    axes[4].set_title("5) Multi PCA UNSUPERVISED processed")
+    axes[4].set_ylabel("a.u.")
+    axes[4].set_xlabel("Time (s)")
 
     header_1 = f"{subject_id} | sfreq={sfreq:.2f} Hz | band={EOG_L_FREQ}-{EOG_H_FREQ} Hz | (NO real EOG)"
     header_2 = (
@@ -1079,6 +1185,7 @@ def plot_methods_overlay_meg_only(
       - Global PCA processed
       - Frontal PCA unsupervised processed
       - ICA unsupervised processed
+      - PCA proxy ICA adapted processed
       - Multi PCA unsupervised processed
     """
     n_plot = len(t)
@@ -1088,6 +1195,9 @@ def plot_methods_overlay_meg_only(
     plt.plot(t, traces["pca_frontal_unsup_proc"][:n_plot], label=f"Frontal PCA UNSUP ({FRONTAL_PCA_UNSUPERVISED_MODE})")
     plt.plot(t, traces["ica_unsup_proc"][:n_plot],
              label=f"ICA UNSUP (IC{extra_info['ica_unsup_best_ic']}, score={extra_info['ica_unsup_score']:.3f})")
+    plt.plot(t, traces["pca_proxy_ica_adapted_proc"][:n_plot],
+             label=f"PCA proxy ICA adapted (IC{extra_info['pca_proxy_ica_adapted_ic']}, "
+                   f"score={extra_info['pca_proxy_ica_adapted_score']:.3f})")
     plt.plot(t, traces["multi_pca_unsup_proc"][:n_plot], label="Multi PCA UNSUP")
 
     plt.legend()
@@ -1195,8 +1305,11 @@ def process_file(data_path: Path):
     #   - Also useful as sign proxy for unsupervised ICA if UNSUP_SIGN_MODE="frontal_proxy"
     # -------------------------------------------------------------------------
     try:
-        syn_pca_front_unsup_raw = build_synth_eog_pca_frontal_unsupervised(raw_meg_only)
-        syn_pca_front_unsup_raw, pca_front_unsup_details = select_best_scored_polarity(syn_pca_front_unsup_raw, sfreq)
+        pca_proxy_frontal_raw = build_synth_eog_pca_frontal_unsupervised(raw_meg_only)
+        syn_pca_front_unsup_raw = pca_proxy_frontal_raw.copy()
+        syn_pca_front_unsup_raw, pca_front_unsup_details = select_best_scored_polarity(
+            syn_pca_front_unsup_raw, sfreq
+        )
         syn_pca_front_unsup_proc = process_eog_trace(syn_pca_front_unsup_raw, sfreq, EOG_L_FREQ, EOG_H_FREQ)[:n_total]
     except Exception as e:
         # In MEG-only mode, if this fails we can still proceed with ICA peak polarity sign.
@@ -1204,6 +1317,7 @@ def process_file(data_path: Path):
         print(f"  WARNING Frontal PCA unsupervised failed: {e}")
         syn_pca_front_unsup_raw = None
         syn_pca_front_unsup_proc = None
+        pca_proxy_frontal_raw = None
     
     # -------------------------------------------------------------------------
     # Step 6) If we are in benchmark mode, compute Frontal PCA supervised
@@ -1260,7 +1374,23 @@ def process_file(data_path: Path):
     syn_ica_unsup_proc = process_eog_trace(syn_ica_unsup_raw, sfreq, EOG_L_FREQ, EOG_H_FREQ)[:n_total]
 
     # -------------------------------------------------------------------------
-    # Step 9b) Multi PCA unsupervised (align + z-score + PCA across 3 proxies)
+    # Step 9b) PCA proxy ICA adapted (frontal PCA proxy + ICA corr + score)
+    # -------------------------------------------------------------------------
+    pca_proxy_for_ica = pca_proxy_frontal_raw if pca_proxy_frontal_raw is not None else syn_pca_all_raw
+    adapted_ic, adapted_details = pick_best_ic_pca_proxy_adapted(
+        sources,
+        pca_proxy=pca_proxy_for_ica[:n_total],
+        sfreq=sfreq,
+    )
+    syn_ica_pca_proxy_raw = sources[adapted_ic, :n_total]
+    if adapted_details.get("flip_for_corr", False):
+        syn_ica_pca_proxy_raw = -syn_ica_pca_proxy_raw
+    syn_ica_pca_proxy_proc = process_eog_trace(
+        syn_ica_pca_proxy_raw, sfreq, EOG_L_FREQ, EOG_H_FREQ
+    )[:n_total]
+
+    # -------------------------------------------------------------------------
+    # Step 9c) Multi PCA unsupervised (align + z-score + PCA across 3 proxies)
     # -------------------------------------------------------------------------
     frontal_for_multi = syn_pca_front_unsup_raw if syn_pca_front_unsup_raw is not None else syn_pca_all_raw
     multi_pca_raw, multi_pca_details = build_multi_pca_unsupervised(
@@ -1282,6 +1412,10 @@ def process_file(data_path: Path):
         ica_unsup_selection_mode=unsup_details.get("selection_mode", ICA_UNSUP_MODE),
         ica_unsup_sign_mode=UNSUP_SIGN_MODE,
         multi_pca_unsup_score=multi_pca_details.get("score", float("nan")),
+        pca_proxy_ica_adapted_ic=adapted_ic,
+        pca_proxy_ica_adapted_corr=adapted_details.get("chosen_corr", float("nan")),
+        pca_proxy_ica_adapted_score=adapted_details.get("chosen_score", float("nan")),
+        pca_proxy_ica_adapted_selection_mode=adapted_details.get("selection_mode", ""),
     )
     
     # -------------------------------------------------------------------------
@@ -1301,6 +1435,7 @@ def process_file(data_path: Path):
             pca_all_proc=syn_pca_all_proc,
             pca_frontal_unsup_proc=syn_pca_front_unsup_proc,
             ica_unsup_proc=syn_ica_unsup_proc,
+            pca_proxy_ica_adapted_proc=syn_ica_pca_proxy_proc,
             multi_pca_unsup_proc=multi_pca_proc,
         )
     
@@ -1370,6 +1505,15 @@ def process_file(data_path: Path):
                 ica_unsup_lag_samples=np.nan,
                 ica_unsup_lag_seconds=np.nan,
 
+                # PCA proxy ICA adapted (MEG-only)
+                pca_proxy_ica_adapted_ic=adapted_ic,
+                pca_proxy_ica_adapted_corr=adapted_details.get("chosen_corr", float("nan")),
+                pca_proxy_ica_adapted_score=adapted_details.get("chosen_score", float("nan")),
+                pca_proxy_ica_adapted_corr_before=np.nan,
+                pca_proxy_ica_adapted_corr_after=np.nan,
+                pca_proxy_ica_adapted_lag_samples=np.nan,
+                pca_proxy_ica_adapted_lag_seconds=np.nan,
+
                 # Multi PCA unsupervised (MEG-only)
                 multi_pca_unsup_corr_before=np.nan,
                 multi_pca_unsup_corr_after=np.nan,
@@ -1417,7 +1561,13 @@ def process_file(data_path: Path):
     r_ica_unsup_before, _ = pearsonr(eog_ref_proc, syn_ica_unsup_proc)
     r_ica_unsup_after, _ = pearsonr(eog_ref_proc, syn_ica_unsup_aligned)
 
-    # E) Multi PCA unsupervised alignment/correlation
+    # E) PCA proxy ICA adapted alignment/correlation
+    lag_pca_proxy_ica = best_lag_via_xcorr(eog_ref_proc, syn_ica_pca_proxy_proc)
+    syn_ica_pca_proxy_aligned = shift_with_zeros(syn_ica_pca_proxy_proc, lag_pca_proxy_ica)
+    r_pca_proxy_ica_before, _ = pearsonr(eog_ref_proc, syn_ica_pca_proxy_proc)
+    r_pca_proxy_ica_after, _ = pearsonr(eog_ref_proc, syn_ica_pca_proxy_aligned)
+
+    # F) Multi PCA unsupervised alignment/correlation
     lag_multi_pca = best_lag_via_xcorr(eog_ref_proc, multi_pca_proc)
     multi_pca_aligned = shift_with_zeros(multi_pca_proc, lag_multi_pca)
     r_multi_pca_before, _ = pearsonr(eog_ref_proc, multi_pca_proc)
@@ -1434,6 +1584,7 @@ def process_file(data_path: Path):
         pca_frontal_sup_aligned=syn_pca_front_sup_aligned,
         ica_sup_aligned=syn_ica_sup_aligned,
         ica_unsup_aligned=syn_ica_unsup_aligned,
+        pca_proxy_ica_adapted_aligned=syn_ica_pca_proxy_aligned,
         multi_pca_unsup_aligned=multi_pca_aligned,
     )
     
@@ -1442,6 +1593,7 @@ def process_file(data_path: Path):
         pca_frontal_sup=lag_pca_front_sup,
         ica_sup=lag_ica_sup,
         ica_unsup=lag_ica_unsup,
+        pca_proxy_ica_adapted=lag_pca_proxy_ica,
         multi_pca_unsup=lag_multi_pca,
     )
     
@@ -1450,6 +1602,7 @@ def process_file(data_path: Path):
         pca_frontal_sup=r_pca_front_sup_after,
         ica_sup=r_ica_sup_after,
         ica_unsup=r_ica_unsup_after,
+        pca_proxy_ica_adapted=r_pca_proxy_ica_after,
         multi_pca_unsup=r_multi_pca_after,
     )
     
@@ -1532,6 +1685,15 @@ def process_file(data_path: Path):
             ica_unsup_lag_samples=lag_ica_unsup,
             ica_unsup_lag_seconds=lag_ica_unsup / sfreq,
 
+            # PCA proxy ICA adapted
+            pca_proxy_ica_adapted_ic=adapted_ic,
+            pca_proxy_ica_adapted_corr=adapted_details.get("chosen_corr", float("nan")),
+            pca_proxy_ica_adapted_score=adapted_details.get("chosen_score", float("nan")),
+            pca_proxy_ica_adapted_corr_before=r_pca_proxy_ica_before,
+            pca_proxy_ica_adapted_corr_after=r_pca_proxy_ica_after,
+            pca_proxy_ica_adapted_lag_samples=lag_pca_proxy_ica,
+            pca_proxy_ica_adapted_lag_seconds=lag_pca_proxy_ica / sfreq,
+
             # Multi PCA unsupervised
             multi_pca_unsup_corr_before=r_multi_pca_before,
             multi_pca_unsup_corr_after=r_multi_pca_after,
@@ -1575,8 +1737,10 @@ if len(df) > 0:
         "pca_frontal_sup_corr_after",
         "ica_sup_corr_after",
         "ica_unsup_corr_after",
+        "pca_proxy_ica_adapted_corr_after",
         "multi_pca_unsup_corr_after",
         "ica_unsup_score",
+        "pca_proxy_ica_adapted_score",
         "multi_pca_unsup_score",
     ]
     cols = [c for c in cols if c in df.columns]
