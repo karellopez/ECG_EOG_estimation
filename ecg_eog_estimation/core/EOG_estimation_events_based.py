@@ -39,6 +39,7 @@ Always computed:
   - PCA global (MEG-only)
   - PCA frontal unsupervised (MEG-only)
   - ICA unsupervised (MEG-only, selection fixed/heuristic; sign convention applied)
+  - Multi PCA unsupervised (align global/frontal/ICA + PCA)
 
 If a REAL EOG channel exists, we additionally compute (benchmark extras):
   - PCA frontal supervised (uses real EOG for sensor ranking)
@@ -408,6 +409,59 @@ def pca_first_component(data_ch_by_time: np.ndarray) -> np.ndarray:
     if np.corrcoef(pc1, mean_sig)[0, 1] < 0:
         pc1 = -pc1
     return pc1
+
+
+def select_best_scored_polarity(x: np.ndarray, sfreq: float) -> Tuple[np.ndarray, Dict]:
+    """
+    Pick the polarity (original or flipped) that yields the better blink-likeness score.
+
+    Returns:
+      best_signal, details dict including score and flip flag.
+    """
+    details_pos = blink_likeness_score(x, sfreq)
+    details_neg = blink_likeness_score(-x, sfreq)
+    if details_neg["score"] > details_pos["score"]:
+        details = details_neg
+        details["flip_for_score"] = True
+        return -x, details
+    details = details_pos
+    details["flip_for_score"] = False
+    return x, details
+
+
+def align_signals_to_reference(ref: np.ndarray, others: List[np.ndarray]) -> List[np.ndarray]:
+    """
+    Align each signal in "others" to ref using xcorr lag.
+    """
+    aligned = []
+    for sig in others:
+        lag = best_lag_via_xcorr(ref, sig)
+        aligned.append(shift_with_zeros(sig, lag))
+    return aligned
+
+
+def build_multi_pca_unsupervised(
+    global_pca: np.ndarray,
+    frontal_pca: np.ndarray,
+    ica_unsup: np.ndarray,
+    sfreq: float,
+) -> Tuple[np.ndarray, Dict]:
+    """
+    Build "Multi PCA unsupervised" by aligning + z-scoring the three MEG-only proxies,
+    then extracting PC1 across them. Polarity is chosen by blink-likeness score.
+    """
+    ref = global_pca
+    aligned_frontal, aligned_ica = align_signals_to_reference(ref, [frontal_pca, ica_unsup])
+    X = np.vstack(
+        [
+            safe_zscore(ref),
+            safe_zscore(aligned_frontal),
+            safe_zscore(aligned_ica),
+        ]
+    )
+    multi_raw = pca_first_component(X)
+    multi_best, details = select_best_scored_polarity(multi_raw, sfreq)
+    return multi_best, details
 
 
 def build_synth_eog_pca_all(raw_meg: mne.io.BaseRaw) -> np.ndarray:
@@ -976,6 +1030,42 @@ def plot_event_overlay(
     plt.close(fig)
 
 
+def plot_meg_only_stacked(
+    out_png: str,
+    t: np.ndarray,
+    traces: Dict[str, np.ndarray],
+    subject_id: str,
+    sfreq: float,
+):
+    """
+    Simple stacked plot for MEG-only mode (no real EOG).
+    """
+    n_plot = len(t)
+    fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
+
+    axes[0].plot(t, traces["pca_all_proc"][:n_plot])
+    axes[0].set_title("1) Global PCA (MEG-only) processed")
+    axes[0].set_ylabel("a.u.")
+
+    axes[1].plot(t, traces["pca_frontal_unsup_proc"][:n_plot])
+    axes[1].set_title(f"2) Frontal PCA UNSUP ({FRONTAL_PCA_UNSUPERVISED_MODE}) processed")
+    axes[1].set_ylabel("a.u.")
+
+    axes[2].plot(t, traces["ica_unsup_proc"][:n_plot])
+    axes[2].set_title("3) ICA UNSUP processed")
+    axes[2].set_ylabel("a.u.")
+
+    axes[3].plot(t, traces["multi_pca_unsup_proc"][:n_plot])
+    axes[3].set_title("4) Multi PCA UNSUP processed")
+    axes[3].set_ylabel("a.u.")
+    axes[3].set_xlabel("Time (s)")
+
+    fig.suptitle(f"{subject_id} | sfreq={sfreq:.2f} Hz | NO real EOG", y=0.995, fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -1018,44 +1108,51 @@ def process_file(data_path: Path):
     has_real_eog = eog_idx >= 0
     
     if not has_real_eog:
-        print("  No real EOG channel -> skipping (this script is event-validation vs real EOG).")
-        return None
+        print("  No real EOG channel -> MEG-only mode (generate proxies + Multi PCA unsupervised).")
     
-    eog_ch_name = raw.ch_names[eog_idx]
-    eog_raw_real = raw.get_data(picks=[eog_idx])[0]
-    eog_ref_proc = process_trace_bandpass_z(eog_raw_real, sfreq, EOG_L_FREQ, EOG_H_FREQ)
-    
-    # Ground-truth events from REAL EOG
-    try:
-        eog_events_ref = mne.preprocessing.find_eog_events(raw, ch_name=eog_ch_name, verbose=False)
-        ref_events_abs = extract_event_samples(eog_events_ref)
-    except Exception as e:
-        print(f"  ERROR find_eog_events on real EOG: {e}")
-        return None
-    
+    if has_real_eog:
+        eog_ch_name = raw.ch_names[eog_idx]
+        eog_raw_real = raw.get_data(picks=[eog_idx])[0]
+        eog_ref_proc = process_trace_bandpass_z(eog_raw_real, sfreq, EOG_L_FREQ, EOG_H_FREQ)
+
+        # Ground-truth events from REAL EOG
+        try:
+            eog_events_ref = mne.preprocessing.find_eog_events(raw, ch_name=eog_ch_name, verbose=False)
+            ref_events_abs = extract_event_samples(eog_events_ref)
+        except Exception as e:
+            print(f"  ERROR find_eog_events on real EOG: {e}")
+            return None
+    else:
+        eog_ch_name = ""
+        eog_ref_proc = None
+        ref_events_abs = np.array([], dtype=int)
+
     # 3) MEG-only raw
     raw_meg = raw.copy().pick_types(meg=True, eeg=False, eog=False, ecg=False, stim=False)
-    
+
     # common length
-    n_total = min(len(eog_ref_proc), raw_meg.n_times)
+    n_total = raw_meg.n_times if not has_real_eog else min(len(eog_ref_proc), raw_meg.n_times)
     if n_total < int(round(10 * sfreq)):
         print("  Too short -> skipping")
         return None
+
+    if has_real_eog:
+        eog_ref_proc = eog_ref_proc[:n_total]
     
-    eog_ref_proc = eog_ref_proc[:n_total]
-    
-    # 4) Global PCA (MEG-only)
+    # 4) Global PCA (MEG-only) + unsupervised polarity selection
     try:
         pca_all_raw = build_synth_eog_pca_all(raw_meg)[:n_total]
+        pca_all_raw, pca_all_details = select_best_scored_polarity(pca_all_raw, sfreq)
         pca_all_proc = process_trace_bandpass_z(pca_all_raw, sfreq, EOG_L_FREQ, EOG_H_FREQ)[:n_total]
         _, pca_all_events_abs = events_from_trace_via_mne_find_eog(pca_all_raw[:n_total], sfreq, raw.first_samp)
     except Exception as e:
         print(f"  ERROR Global PCA: {e}")
         return None
     
-    # 5) Frontal PCA UNSUP (MEG-only)
+    # 5) Frontal PCA UNSUP (MEG-only) + polarity selection
     try:
         pca_front_unsup_raw = build_synth_eog_pca_frontal_unsupervised(raw_meg)[:n_total]
+        pca_front_unsup_raw, pca_front_unsup_details = select_best_scored_polarity(pca_front_unsup_raw, sfreq)
         pca_front_unsup_proc = process_trace_bandpass_z(pca_front_unsup_raw, sfreq, EOG_L_FREQ, EOG_H_FREQ)[:n_total]
         _, pca_front_unsup_events_abs = events_from_trace_via_mne_find_eog(pca_front_unsup_raw[:n_total], sfreq, raw.first_samp)
     except Exception as e:
@@ -1065,13 +1162,18 @@ def process_file(data_path: Path):
         pca_front_unsup_events_abs = np.array([], dtype=int)
     
     # 6) Supervised Frontal PCA (benchmark extra)
-    try:
-        pca_front_sup_raw = build_synth_eog_pca_frontal_supervised(raw_meg, eog_ref_proc)[:n_total]
-        pca_front_sup_proc = process_trace_bandpass_z(pca_front_sup_raw, sfreq, EOG_L_FREQ, EOG_H_FREQ)[:n_total]
-        _, pca_front_sup_events_abs = events_from_trace_via_mne_find_eog(pca_front_sup_raw[:n_total], sfreq, raw.first_samp)
-    except Exception as e:
-        print(f"  ERROR Frontal PCA supervised: {e}")
-        return None
+    if has_real_eog:
+        try:
+            pca_front_sup_raw = build_synth_eog_pca_frontal_supervised(raw_meg, eog_ref_proc)[:n_total]
+            pca_front_sup_proc = process_trace_bandpass_z(pca_front_sup_raw, sfreq, EOG_L_FREQ, EOG_H_FREQ)[:n_total]
+            _, pca_front_sup_events_abs = events_from_trace_via_mne_find_eog(pca_front_sup_raw[:n_total], sfreq, raw.first_samp)
+        except Exception as e:
+            print(f"  ERROR Frontal PCA supervised: {e}")
+            return None
+    else:
+        pca_front_sup_raw = None
+        pca_front_sup_proc = None
+        pca_front_sup_events_abs = np.array([], dtype=int)
     
     # 7) ICA sources ONCE
     try:
@@ -1081,19 +1183,26 @@ def process_file(data_path: Path):
         return None
     
     # 8) ICA supervised (benchmark extra)
-    try:
-        ica_sup_ic, ica_sup_abs_corr = pick_best_ic_supervised_from_sources(sources, eog_ref_proc)
-        ica_sup_raw = sources[ica_sup_ic, :n_total]
-    
-        # sign stabilization (benchmark-only): positive corr to real EOG
-        if np.corrcoef(ica_sup_raw, eog_ref_proc)[0, 1] < 0:
-            ica_sup_raw = -ica_sup_raw
-    
-        ica_sup_proc = process_trace_bandpass_z(ica_sup_raw, sfreq, EOG_L_FREQ, EOG_H_FREQ)[:n_total]
-        _, ica_sup_events_abs = events_from_trace_via_mne_find_eog(ica_sup_raw, sfreq, raw.first_samp)
-    except Exception as e:
-        print(f"  ERROR ICA supervised: {e}")
-        return None
+    if has_real_eog:
+        try:
+            ica_sup_ic, ica_sup_abs_corr = pick_best_ic_supervised_from_sources(sources, eog_ref_proc)
+            ica_sup_raw = sources[ica_sup_ic, :n_total]
+
+            # sign stabilization (benchmark-only): positive corr to real EOG
+            if np.corrcoef(ica_sup_raw, eog_ref_proc)[0, 1] < 0:
+                ica_sup_raw = -ica_sup_raw
+
+            ica_sup_proc = process_trace_bandpass_z(ica_sup_raw, sfreq, EOG_L_FREQ, EOG_H_FREQ)[:n_total]
+            _, ica_sup_events_abs = events_from_trace_via_mne_find_eog(ica_sup_raw, sfreq, raw.first_samp)
+        except Exception as e:
+            print(f"  ERROR ICA supervised: {e}")
+            return None
+    else:
+        ica_sup_ic = None
+        ica_sup_abs_corr = np.nan
+        ica_sup_raw = None
+        ica_sup_proc = None
+        ica_sup_events_abs = np.array([], dtype=int)
     
     # 9) ICA unsupervised (MEG-only)
     try:
@@ -1115,6 +1224,44 @@ def process_file(data_path: Path):
     except Exception as e:
         print(f"  ERROR ICA unsupervised: {e}")
         return None
+
+    # 9b) Multi PCA unsupervised (align + z-score + PCA across 3 proxies)
+    frontal_for_multi = pca_front_unsup_raw if pca_front_unsup_raw is not None else pca_all_raw
+    multi_pca_raw, multi_pca_details = build_multi_pca_unsupervised(
+        pca_all_raw[:n_total],
+        frontal_for_multi[:n_total],
+        ica_unsup_raw[:n_total],
+        sfreq,
+    )
+    multi_pca_proc = process_trace_bandpass_z(multi_pca_raw, sfreq, EOG_L_FREQ, EOG_H_FREQ)[:n_total]
+    _, multi_pca_events_abs = events_from_trace_via_mne_find_eog(multi_pca_raw[:n_total], sfreq, raw.first_samp)
+
+    if not has_real_eog:
+        n_plot = min(n_total, int(round(PLOT_SECONDS * sfreq)))
+        t = np.arange(n_plot) / sfreq
+        stacked_png = os.path.join(OUTPUT_DIR, f"{subject_id}_MEGonly_stacked_MultiPCA.png")
+        plot_meg_only_stacked(
+            out_png=stacked_png,
+            t=t,
+            traces=dict(
+                pca_all_proc=pca_all_proc,
+                pca_frontal_unsup_proc=pca_front_unsup_proc if pca_front_unsup_proc is not None else pca_all_proc,
+                ica_unsup_proc=ica_unsup_proc,
+                multi_pca_unsup_proc=multi_pca_proc,
+            ),
+            subject_id=subject_id,
+            sfreq=sfreq,
+        )
+        return dict(
+            subject=subject_id,
+            file=str(data_path),
+            sfreq_hz=sfreq,
+            duration_sec=n_total / sfreq,
+            has_real_eog=False,
+            eog_channel="",
+            stacked_plot=stacked_png,
+            multi_pca_unsup_score=multi_pca_details.get("score", np.nan),
+        )
     
 # =============================================================================
     # EVENT METRICS (PRIMARY)
@@ -1152,6 +1299,11 @@ def process_file(data_path: Path):
     mref_iu, mtest_iu, uref_iu, utest_iu = match_events_one_to_one(ref_events_abs, ica_unsup_events_abs, sfreq, MATCH_TOL_SEC)
     met_iu = compute_detection_metrics(mref_iu, mtest_iu, uref_iu, utest_iu, sfreq)
     fpmin_iu = met_iu["FP"] / (duration_sec / 60.0) if duration_sec > 0 else np.nan
+
+    # Multi PCA unsupervised
+    mref_mu, mtest_mu, uref_mu, utest_mu = match_events_one_to_one(ref_events_abs, multi_pca_events_abs, sfreq, MATCH_TOL_SEC)
+    met_mu = compute_detection_metrics(mref_mu, mtest_mu, uref_mu, utest_mu, sfreq)
+    fpmin_mu = met_mu["FP"] / (duration_sec / 60.0) if duration_sec > 0 else np.nan
     
 # =============================================================================
     # WAVEFORM LAG + CORR (SECONDARY, like your v7)
@@ -1182,6 +1334,9 @@ def process_file(data_path: Path):
     
     # ICA unsupervised
     r_iu0, r_iu1, lag_iu, ica_unsup_aligned = corr_with_lag(eog_ref_proc, ica_unsup_proc)
+
+    # Multi PCA unsupervised
+    r_mu0, r_mu1, lag_mu, multi_pca_aligned = corr_with_lag(eog_ref_proc, multi_pca_proc)
     
 # =============================================================================
     # PLOTS (event-aware)
@@ -1237,6 +1392,16 @@ def process_file(data_path: Path):
         metrics=met_iu, label_test=f"Test: ICA UNSUP ({ICA_UNSUP_MODE}; IC{ica_unsup_ic}; sign={UNSUP_SIGN_MODE})",
         match_tol_sec=MATCH_TOL_SEC, seconds=PLOT_SECONDS
     )
+
+    plot_event_overlay(
+        out_png=os.path.join(OUTPUT_DIR, f"{subject_id}_EV_MultiPCAunsup.png"),
+        subject_id=subject_id, sfreq=sfreq, first_samp=raw.first_samp,
+        ref_trace_proc=eog_ref_proc, test_trace_proc=multi_pca_proc,
+        ref_events_abs=ref_events_abs, test_events_abs=multi_pca_events_abs,
+        matched_ref_abs=mref_mu, matched_test_abs=mtest_mu,
+        metrics=met_mu, label_test="Test: Multi PCA UNSUP",
+        match_tol_sec=MATCH_TOL_SEC, seconds=PLOT_SECONDS
+    )
     
 # =============================================================================
     # CSV ROW
@@ -1246,6 +1411,7 @@ def process_file(data_path: Path):
         file=str(data_path),
         sfreq_hz=sfreq,
         duration_sec=duration_sec,
+        has_real_eog=True,
         eog_channel=eog_ch_name,
         match_tol_ms=1e3 * MATCH_TOL_SEC,
     
@@ -1269,6 +1435,11 @@ def process_file(data_path: Path):
         ica_unsup_pos_rate_per_min=unsup_details.get("pos_rate_per_min", np.nan),
         ica_unsup_neg_rate_per_min=unsup_details.get("neg_rate_per_min", np.nan),
         ica_unsup_r_before=r_iu0, ica_unsup_r_after=r_iu1, ica_unsup_lag_samples=lag_iu, ica_unsup_lag_sec=lag_iu/sfreq,
+
+        # Multi PCA unsupervised
+        multi_pca_unsup_score=multi_pca_details.get("score", np.nan),
+        multi_pca_unsup_r_before=r_mu0, multi_pca_unsup_r_after=r_mu1,
+        multi_pca_unsup_lag_samples=lag_mu, multi_pca_unsup_lag_sec=lag_mu / sfreq,
     
         # Event metrics (primary) — PCA global
         pca_global_TP=met_g["TP"], pca_global_FP=met_g["FP"], pca_global_FN=met_g["FN"],
@@ -1299,6 +1470,12 @@ def process_file(data_path: Path):
         ica_unsup_precision=met_iu["precision"], ica_unsup_recall=met_iu["recall"], ica_unsup_f1=met_iu["f1"],
         ica_unsup_miss_rate=met_iu["miss_rate"], ica_unsup_fp_per_min=fpmin_iu,
         ica_unsup_jitter_mae_ms=met_iu["jitter_mae_ms"], ica_unsup_jitter_p95_ms=met_iu["jitter_p95_abs_ms"],
+
+        # Event metrics — Multi PCA unsup
+        multi_pca_unsup_TP=met_mu["TP"], multi_pca_unsup_FP=met_mu["FP"], multi_pca_unsup_FN=met_mu["FN"],
+        multi_pca_unsup_precision=met_mu["precision"], multi_pca_unsup_recall=met_mu["recall"], multi_pca_unsup_f1=met_mu["f1"],
+        multi_pca_unsup_miss_rate=met_mu["miss_rate"], multi_pca_unsup_fp_per_min=fpmin_mu,
+        multi_pca_unsup_jitter_mae_ms=met_mu["jitter_mae_ms"], multi_pca_unsup_jitter_p95_ms=met_mu["jitter_p95_abs_ms"],
     )
     
     print(
@@ -1306,7 +1483,8 @@ def process_file(data_path: Path):
         f"PCAfrontUNSUP={met_fu['f1'] if np.isfinite(met_fu['f1']) else np.nan} | "
         f"PCAfrontSUP={met_fs['f1']:.3f} | "
         f"ICAsup={met_is['f1']:.3f} | "
-        f"ICAunsup={met_iu['f1']:.3f} (IC{ica_unsup_ic}, mode={ICA_UNSUP_MODE}, sign={UNSUP_SIGN_MODE})"
+        f"ICAunsup={met_iu['f1']:.3f} (IC{ica_unsup_ic}, mode={ICA_UNSUP_MODE}, sign={UNSUP_SIGN_MODE}) | "
+        f"MultiPCAunsup={met_mu['f1']:.3f}"
     )
     return result
     
@@ -1331,7 +1509,8 @@ if len(df) > 0:
     cols = [
         "pca_global_f1", "pca_frontal_unsup_f1", "pca_frontal_sup_f1",
         "ica_sup_f1", "ica_unsup_f1",
-        "ica_unsup_score"
+        "multi_pca_unsup_f1",
+        "ica_unsup_score", "multi_pca_unsup_score"
     ]
     cols = [c for c in cols if c in df.columns]
     print(df[cols].describe(include="all"))
