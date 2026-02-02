@@ -1040,10 +1040,11 @@ def plot_methods_stacked_benchmark(
     axes[5].set_ylabel("a.u.")
 
     axes[6].plot(t, traces["pca_proxy_ica_adapted_aligned"][:n_plot])
+    flip_tag = " | flip" if extra_info.get("pca_proxy_ica_adapted_flip") else ""
     axes[6].set_title(
         f"7) PCA PROXY ICA ADAPTED (IC={extra_info['pca_proxy_ica_adapted_ic']}, "
-        f"corr={extra_info['pca_proxy_ica_adapted_corr']:.3f}, score={extra_info['pca_proxy_ica_adapted_score']:.3f}) | "
-        f"lag={lag_info['pca_proxy_ica_adapted']} | r={corr_info['pca_proxy_ica_adapted']:.3f}"
+        f"corr={extra_info['pca_proxy_ica_adapted_corr']:.3f}, score={extra_info['pca_proxy_ica_adapted_score']:.3f})"
+        f"{flip_tag} | lag={lag_info['pca_proxy_ica_adapted']} | r={corr_info['pca_proxy_ica_adapted']:.3f}"
     )
     axes[6].set_ylabel("a.u.")
 
@@ -1073,6 +1074,7 @@ def plot_methods_overlay_benchmark(
         eog_ref_proc: np.ndarray,
         traces: dict,
         subject_id: str,
+        extra_info: dict,
         corr_info: dict,
 ):
     """
@@ -1094,8 +1096,9 @@ def plot_methods_overlay_benchmark(
              label=f"Frontal PCA SUP r={corr_info['pca_frontal_sup']:.3f}")
     plt.plot(t, traces["ica_sup_aligned"][:n_plot], label=f"ICA SUP r={corr_info['ica_sup']:.3f}")
     plt.plot(t, traces["ica_unsup_aligned"][:n_plot], label=f"ICA UNSUP r={corr_info['ica_unsup']:.3f}")
+    flip_tag = " | flip" if extra_info.get("pca_proxy_ica_adapted_flip") else ""
     plt.plot(t, traces["pca_proxy_ica_adapted_aligned"][:n_plot],
-             label=f"PCA proxy ICA adapted r={corr_info['pca_proxy_ica_adapted']:.3f}")
+             label=f"PCA proxy ICA adapted r={corr_info['pca_proxy_ica_adapted']:.3f}{flip_tag}")
     plt.plot(t, traces["multi_pca_unsup_aligned"][:n_plot], label=f"Multi PCA UNSUP r={corr_info['multi_pca_unsup']:.3f}")
 
     plt.legend()
@@ -1149,9 +1152,11 @@ def plot_methods_stacked_meg_only(
     axes[2].set_ylabel("a.u.")
 
     axes[3].plot(t, traces["pca_proxy_ica_adapted_proc"][:n_plot])
+    flip_tag = " | flip" if extra_info.get("pca_proxy_ica_adapted_flip") else ""
     axes[3].set_title(
         f"4) PCA PROXY ICA ADAPTED (IC={extra_info['pca_proxy_ica_adapted_ic']}, "
         f"corr={extra_info['pca_proxy_ica_adapted_corr']:.3f}, score={extra_info['pca_proxy_ica_adapted_score']:.3f})"
+        f"{flip_tag}"
     )
     axes[3].set_ylabel("a.u.")
 
@@ -1195,9 +1200,10 @@ def plot_methods_overlay_meg_only(
     plt.plot(t, traces["pca_frontal_unsup_proc"][:n_plot], label=f"Frontal PCA UNSUP ({FRONTAL_PCA_UNSUPERVISED_MODE})")
     plt.plot(t, traces["ica_unsup_proc"][:n_plot],
              label=f"ICA UNSUP (IC{extra_info['ica_unsup_best_ic']}, score={extra_info['ica_unsup_score']:.3f})")
+    flip_tag = " | flip" if extra_info.get("pca_proxy_ica_adapted_flip") else ""
     plt.plot(t, traces["pca_proxy_ica_adapted_proc"][:n_plot],
              label=f"PCA proxy ICA adapted (IC{extra_info['pca_proxy_ica_adapted_ic']}, "
-                   f"score={extra_info['pca_proxy_ica_adapted_score']:.3f})")
+                   f"score={extra_info['pca_proxy_ica_adapted_score']:.3f}{flip_tag})")
     plt.plot(t, traces["multi_pca_unsup_proc"][:n_plot], label="Multi PCA UNSUP")
 
     plt.legend()
@@ -1383,7 +1389,8 @@ def process_file(data_path: Path):
         sfreq=sfreq,
     )
     syn_ica_pca_proxy_raw = sources[adapted_ic, :n_total]
-    if adapted_details.get("flip_for_corr", False):
+    adapted_flip = bool(adapted_details.get("flip_for_corr", False)) or bool(adapted_details.get("flip_for_score", False))
+    if adapted_flip:
         syn_ica_pca_proxy_raw = -syn_ica_pca_proxy_raw
     syn_ica_pca_proxy_proc = process_eog_trace(
         syn_ica_pca_proxy_raw, sfreq, EOG_L_FREQ, EOG_H_FREQ
@@ -1415,6 +1422,7 @@ def process_file(data_path: Path):
         pca_proxy_ica_adapted_ic=adapted_ic,
         pca_proxy_ica_adapted_corr=adapted_details.get("chosen_corr", float("nan")),
         pca_proxy_ica_adapted_score=adapted_details.get("chosen_score", float("nan")),
+        pca_proxy_ica_adapted_flip=adapted_flip,
         pca_proxy_ica_adapted_selection_mode=adapted_details.get("selection_mode", ""),
     )
     
@@ -1634,6 +1642,7 @@ def process_file(data_path: Path):
         eog_ref_proc=eog_ref_proc,
         traces=traces_benchmark,
         subject_id=subject_id,
+        extra_info=extra_info_benchmark,
         corr_info=corr_info,
     )
     
