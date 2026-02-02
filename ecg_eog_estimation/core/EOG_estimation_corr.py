@@ -20,11 +20,13 @@ When a REAL EOG channel exists (benchmark mode):
   4) Frontal PCA supervised                   [uses real EOG to rank sensors]
   5) ICA supervised                           [uses real EOG to select IC]
   6) ICA unsupervised                         [MEG-only selection + sign convention]
+  7) Multi PCA unsupervised                   [align global/frontal/ICA + PCA]
 
 When NO REAL EOG channel exists (MEG-only mode):
   1) Global PCA (MEG-only)
   2) Frontal PCA unsupervised
   3) ICA unsupervised
+  4) Multi PCA unsupervised
 and we generate plots + CSV row with only MEG-only metrics (no correlations to real EOG).
 
 -------------------------------------------------------------------------------
@@ -294,6 +296,62 @@ def pca_first_component(data_ch_by_time: np.ndarray) -> np.ndarray:
         pc1 = -pc1
 
     return pc1
+
+
+def select_best_scored_polarity(x: np.ndarray, sfreq: float) -> tuple[np.ndarray, dict]:
+    """
+    Pick the polarity (original or flipped) that yields the better blink-likeness score.
+
+    Returns:
+      best_signal, details dict including score and flip flag.
+    """
+    details_pos = blink_likeness_score(x, sfreq)
+    details_neg = blink_likeness_score(-x, sfreq)
+    if details_neg["score"] > details_pos["score"]:
+        details = details_neg
+        details["flip_for_score"] = True
+        return -x, details
+    details = details_pos
+    details["flip_for_score"] = False
+    return x, details
+
+
+def align_signals_to_reference(ref: np.ndarray, others: list[np.ndarray]) -> list[np.ndarray]:
+    """
+    Align each signal in "others" to ref using xcorr lag.
+
+    Returns:
+      list of aligned signals in same order as input.
+    """
+    aligned = []
+    for sig in others:
+        lag = best_lag_via_xcorr(ref, sig)
+        aligned.append(shift_with_zeros(sig, lag))
+    return aligned
+
+
+def build_multi_pca_unsupervised(
+    global_pca: np.ndarray,
+    frontal_pca: np.ndarray,
+    ica_unsup: np.ndarray,
+    sfreq: float,
+) -> tuple[np.ndarray, dict]:
+    """
+    Build "Multi PCA unsupervised" by aligning + z-scoring the three MEG-only proxies,
+    then extracting PC1 across them. Polarity is chosen by blink-likeness score.
+    """
+    ref = global_pca
+    aligned_frontal, aligned_ica = align_signals_to_reference(ref, [frontal_pca, ica_unsup])
+    X = np.vstack(
+        [
+            safe_zscore(ref),
+            safe_zscore(aligned_frontal),
+            safe_zscore(aligned_ica),
+        ]
+    )
+    multi_raw = pca_first_component(X)
+    multi_best, details = select_best_scored_polarity(multi_raw, sfreq)
+    return multi_best, details
 
 
 def build_synth_eog_pca_all(raw_meg: mne.io.BaseRaw) -> np.ndarray:
@@ -846,7 +904,7 @@ def plot_methods_stacked_benchmark(
         extra_info: dict,
 ):
     """
-    Create the 6-panel stacked figure used in benchmark mode.
+    Create the 7-panel stacked figure used in benchmark mode.
 
     Panels:
       1) Real EOG raw (z)
@@ -855,11 +913,12 @@ def plot_methods_stacked_benchmark(
       4) Frontal PCA supervised aligned
       5) ICA supervised aligned
       6) ICA unsupervised aligned (MEG-only selection + sign rule; benchmark-only alignment)
+      7) Multi PCA unsupervised aligned
 
     The title includes compact diagnostics from unsupervised ICA scoring.
     """
     n_plot = len(t)
-    fig, axes = plt.subplots(6, 1, figsize=(14, 12), sharex=True)
+    fig, axes = plt.subplots(7, 1, figsize=(14, 13.5), sharex=True)
 
     axes[0].plot(t, safe_zscore(eog_raw_real[:n_plot]))
     axes[0].set_title("1) Real EOG channel (raw) [z-score]")
@@ -892,7 +951,13 @@ def plot_methods_stacked_benchmark(
         f"sign={extra_info['ica_unsup_sign_mode']} | lag={lag_info['ica_unsup']} | r={corr_info['ica_unsup']:.3f}"
     )
     axes[5].set_ylabel("a.u.")
-    axes[5].set_xlabel("Time (s)")
+
+    axes[6].plot(t, traces["multi_pca_unsup_aligned"][:n_plot])
+    axes[6].set_title(
+        f"7) Multi PCA UNSUPERVISED | lag={lag_info['multi_pca_unsup']} | r={corr_info['multi_pca_unsup']:.3f}"
+    )
+    axes[6].set_ylabel("a.u.")
+    axes[6].set_xlabel("Time (s)")
 
     header_1 = f"{subject_id} | sfreq={sfreq:.2f} Hz | band={EOG_L_FREQ}-{EOG_H_FREQ} Hz"
     header_2 = (
@@ -922,6 +987,7 @@ def plot_methods_overlay_benchmark(
       - supervised frontal PCA
       - ICA supervised
       - ICA unsupervised
+      - Multi PCA unsupervised
     """
     n_plot = len(t)
 
@@ -932,6 +998,7 @@ def plot_methods_overlay_benchmark(
              label=f"Frontal PCA SUP r={corr_info['pca_frontal_sup']:.3f}")
     plt.plot(t, traces["ica_sup_aligned"][:n_plot], label=f"ICA SUP r={corr_info['ica_sup']:.3f}")
     plt.plot(t, traces["ica_unsup_aligned"][:n_plot], label=f"ICA UNSUP r={corr_info['ica_unsup']:.3f}")
+    plt.plot(t, traces["multi_pca_unsup_aligned"][:n_plot], label=f"Multi PCA UNSUP r={corr_info['multi_pca_unsup']:.3f}")
 
     plt.legend()
     plt.title(f"{subject_id} | Overlay (aligned to real EOG)")
@@ -954,17 +1021,18 @@ def plot_methods_stacked_meg_only(
         extra_info: dict,
 ):
     """
-    3-panel stacked plot when no real EOG channel exists.
+    4-panel stacked plot when no real EOG channel exists.
 
     We show only MEG-only methods:
       1) Global PCA (processed)
       2) Frontal PCA unsupervised (processed)
       3) ICA unsupervised (processed)
+      4) Multi PCA unsupervised (processed)
 
     There is no "reference", so we do not compute correlations to real EOG here.
     """
     n_plot = len(t)
-    fig, axes = plt.subplots(3, 1, figsize=(14, 8), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
 
     axes[0].plot(t, traces["pca_all_proc"][:n_plot])
     axes[0].set_title("1) Global PCA (MEG-only) processed (band-pass + z)")
@@ -980,7 +1048,11 @@ def plot_methods_stacked_meg_only(
         f"sign={extra_info['ica_unsup_sign_mode']}"
     )
     axes[2].set_ylabel("a.u.")
-    axes[2].set_xlabel("Time (s)")
+
+    axes[3].plot(t, traces["multi_pca_unsup_proc"][:n_plot])
+    axes[3].set_title("4) Multi PCA UNSUPERVISED processed")
+    axes[3].set_ylabel("a.u.")
+    axes[3].set_xlabel("Time (s)")
 
     header_1 = f"{subject_id} | sfreq={sfreq:.2f} Hz | band={EOG_L_FREQ}-{EOG_H_FREQ} Hz | (NO real EOG)"
     header_2 = (
@@ -1007,6 +1079,7 @@ def plot_methods_overlay_meg_only(
       - Global PCA processed
       - Frontal PCA unsupervised processed
       - ICA unsupervised processed
+      - Multi PCA unsupervised processed
     """
     n_plot = len(t)
 
@@ -1015,6 +1088,7 @@ def plot_methods_overlay_meg_only(
     plt.plot(t, traces["pca_frontal_unsup_proc"][:n_plot], label=f"Frontal PCA UNSUP ({FRONTAL_PCA_UNSUPERVISED_MODE})")
     plt.plot(t, traces["ica_unsup_proc"][:n_plot],
              label=f"ICA UNSUP (IC{extra_info['ica_unsup_best_ic']}, score={extra_info['ica_unsup_score']:.3f})")
+    plt.plot(t, traces["multi_pca_unsup_proc"][:n_plot], label="Multi PCA UNSUP")
 
     plt.legend()
     plt.title(f"{subject_id} | MEG-only overlay (no real EOG)")
@@ -1105,22 +1179,24 @@ def process_file(data_path: Path):
         eog_ref_proc = eog_ref_proc[:n_total]
     
     # -------------------------------------------------------------------------
-    # Step 4) Global PCA proxy (MEG-only)
+    # Step 4) Global PCA proxy (MEG-only) + unsupervised polarity selection
     # -------------------------------------------------------------------------
     try:
         syn_pca_all_raw = build_synth_eog_pca_all(raw_meg_only)
+        syn_pca_all_raw, pca_all_details = select_best_scored_polarity(syn_pca_all_raw, sfreq)
         syn_pca_all_proc = process_eog_trace(syn_pca_all_raw, sfreq, EOG_L_FREQ, EOG_H_FREQ)[:n_total]
     except Exception as e:
         print(f"  ERROR Global PCA: {e}")
         return None
     
     # -------------------------------------------------------------------------
-    # Step 5) Frontal PCA unsupervised proxy (MEG-only)
+    # Step 5) Frontal PCA unsupervised proxy (MEG-only) + polarity selection
     #   - Needed always for MEG-only plots
     #   - Also useful as sign proxy for unsupervised ICA if UNSUP_SIGN_MODE="frontal_proxy"
     # -------------------------------------------------------------------------
     try:
         syn_pca_front_unsup_raw = build_synth_eog_pca_frontal_unsupervised(raw_meg_only)
+        syn_pca_front_unsup_raw, pca_front_unsup_details = select_best_scored_polarity(syn_pca_front_unsup_raw, sfreq)
         syn_pca_front_unsup_proc = process_eog_trace(syn_pca_front_unsup_raw, sfreq, EOG_L_FREQ, EOG_H_FREQ)[:n_total]
     except Exception as e:
         # In MEG-only mode, if this fails we can still proceed with ICA peak polarity sign.
@@ -1182,6 +1258,18 @@ def process_file(data_path: Path):
         syn_ica_unsup_raw = apply_unsup_sign_convention_peak_polarity(syn_ica_unsup_raw, sfreq)
     
     syn_ica_unsup_proc = process_eog_trace(syn_ica_unsup_raw, sfreq, EOG_L_FREQ, EOG_H_FREQ)[:n_total]
+
+    # -------------------------------------------------------------------------
+    # Step 9b) Multi PCA unsupervised (align + z-score + PCA across 3 proxies)
+    # -------------------------------------------------------------------------
+    frontal_for_multi = syn_pca_front_unsup_raw if syn_pca_front_unsup_raw is not None else syn_pca_all_raw
+    multi_pca_raw, multi_pca_details = build_multi_pca_unsupervised(
+        syn_pca_all_raw[:n_total],
+        frontal_for_multi[:n_total],
+        syn_ica_unsup_raw[:n_total],
+        sfreq,
+    )
+    multi_pca_proc = process_eog_trace(multi_pca_raw, sfreq, EOG_L_FREQ, EOG_H_FREQ)[:n_total]
     
     # Collect unsupervised diagnostics into a unified dict for plots/CSV
     extra_info_common = dict(
@@ -1193,6 +1281,7 @@ def process_file(data_path: Path):
         ica_unsup_p_neg_penalty=unsup_details.get("p_neg_penalty", float("nan")),
         ica_unsup_selection_mode=unsup_details.get("selection_mode", ICA_UNSUP_MODE),
         ica_unsup_sign_mode=UNSUP_SIGN_MODE,
+        multi_pca_unsup_score=multi_pca_details.get("score", float("nan")),
     )
     
     # -------------------------------------------------------------------------
@@ -1212,6 +1301,7 @@ def process_file(data_path: Path):
             pca_all_proc=syn_pca_all_proc,
             pca_frontal_unsup_proc=syn_pca_front_unsup_proc,
             ica_unsup_proc=syn_ica_unsup_proc,
+            multi_pca_unsup_proc=multi_pca_proc,
         )
     
         stacked_png = os.path.join(OUTPUT_DIR, f"{subject_id}_MEGonly_stacked_GlobalPCA_FrontalPCA_ICAunsup.png")
@@ -1279,6 +1369,13 @@ def process_file(data_path: Path):
                 ica_unsup_corr_after=np.nan,
                 ica_unsup_lag_samples=np.nan,
                 ica_unsup_lag_seconds=np.nan,
+
+                # Multi PCA unsupervised (MEG-only)
+                multi_pca_unsup_corr_before=np.nan,
+                multi_pca_unsup_corr_after=np.nan,
+                multi_pca_unsup_lag_samples=np.nan,
+                multi_pca_unsup_lag_seconds=np.nan,
+                multi_pca_unsup_score=multi_pca_details.get("score", float("nan")),
     
                 stacked_plot=stacked_png,
                 overlay_plot=overlay_png,
@@ -1319,6 +1416,12 @@ def process_file(data_path: Path):
     syn_ica_unsup_aligned = shift_with_zeros(syn_ica_unsup_proc, lag_ica_unsup)
     r_ica_unsup_before, _ = pearsonr(eog_ref_proc, syn_ica_unsup_proc)
     r_ica_unsup_after, _ = pearsonr(eog_ref_proc, syn_ica_unsup_aligned)
+
+    # E) Multi PCA unsupervised alignment/correlation
+    lag_multi_pca = best_lag_via_xcorr(eog_ref_proc, multi_pca_proc)
+    multi_pca_aligned = shift_with_zeros(multi_pca_proc, lag_multi_pca)
+    r_multi_pca_before, _ = pearsonr(eog_ref_proc, multi_pca_proc)
+    r_multi_pca_after, _ = pearsonr(eog_ref_proc, multi_pca_aligned)
     
     # -------------------------------------------------------------------------
     # Step 12) BENCHMARK MODE plots (6 stacked + overlay)
@@ -1331,6 +1434,7 @@ def process_file(data_path: Path):
         pca_frontal_sup_aligned=syn_pca_front_sup_aligned,
         ica_sup_aligned=syn_ica_sup_aligned,
         ica_unsup_aligned=syn_ica_unsup_aligned,
+        multi_pca_unsup_aligned=multi_pca_aligned,
     )
     
     lag_info = dict(
@@ -1338,6 +1442,7 @@ def process_file(data_path: Path):
         pca_frontal_sup=lag_pca_front_sup,
         ica_sup=lag_ica_sup,
         ica_unsup=lag_ica_unsup,
+        multi_pca_unsup=lag_multi_pca,
     )
     
     corr_info = dict(
@@ -1345,6 +1450,7 @@ def process_file(data_path: Path):
         pca_frontal_sup=r_pca_front_sup_after,
         ica_sup=r_ica_sup_after,
         ica_unsup=r_ica_unsup_after,
+        multi_pca_unsup=r_multi_pca_after,
     )
     
     extra_info_benchmark = dict(
@@ -1425,6 +1531,13 @@ def process_file(data_path: Path):
             ica_unsup_corr_after=r_ica_unsup_after,
             ica_unsup_lag_samples=lag_ica_unsup,
             ica_unsup_lag_seconds=lag_ica_unsup / sfreq,
+
+            # Multi PCA unsupervised
+            multi_pca_unsup_corr_before=r_multi_pca_before,
+            multi_pca_unsup_corr_after=r_multi_pca_after,
+            multi_pca_unsup_lag_samples=lag_multi_pca,
+            multi_pca_unsup_lag_seconds=lag_multi_pca / sfreq,
+            multi_pca_unsup_score=multi_pca_details.get("score", float("nan")),
     
             stacked_plot=stacked_png,
             overlay_plot=overlay_png,
@@ -1462,7 +1575,9 @@ if len(df) > 0:
         "pca_frontal_sup_corr_after",
         "ica_sup_corr_after",
         "ica_unsup_corr_after",
+        "multi_pca_unsup_corr_after",
         "ica_unsup_score",
+        "multi_pca_unsup_score",
     ]
     cols = [c for c in cols if c in df.columns]
     print(df[cols].describe(include="all"))
