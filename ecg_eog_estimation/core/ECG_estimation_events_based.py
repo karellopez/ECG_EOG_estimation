@@ -98,6 +98,15 @@ ICA_METHOD = "fastica"
 ICA_RANDOM_STATE = 97
 ICA_MAX_ITER = 1000
 
+# Unsupervised ICA selection mode: "heuristic" | "megnet" | "hybrid"
+ICA_UNSUP_MODE = "heuristic"
+
+# MEGNet configuration (used when ICA_UNSUP_MODE is "megnet" or "hybrid")
+MEGNET_MODEL_PATH = ""
+MEGNET_INPUT_SAMPLES = 2048
+MEGNET_OUTPUT_INDEX = 0
+MEGNET_SCORE_WEIGHT = 0.5
+
 # Band-pass for ICA stability / focusing on ECG-like content (typical QRS energy)
 ICA_L_FREQ = 5.0
 ICA_H_FREQ = 40.0
@@ -194,6 +203,64 @@ def shift_with_zeros(y: np.ndarray, lag: int) -> np.ndarray:
         k = -lag
         return np.concatenate([np.zeros(k), y[:-k]])
     return y.copy()
+
+
+# =============================================================================
+# MEGNet helpers (optional ICA classification)
+# =============================================================================
+_MEGNET_MODEL = None
+
+
+def _resample_to_length(x: np.ndarray, target_len: int) -> np.ndarray:
+    """
+    Resample a 1D array to target_len using linear interpolation.
+    """
+    if target_len <= 0:
+        raise ValueError("target_len must be positive.")
+    x = np.asarray(x, dtype=float)
+    if len(x) == target_len:
+        return x
+    if len(x) < 2:
+        return np.full(target_len, float(x[0]) if len(x) == 1 else 0.0, dtype=float)
+    xp = np.linspace(0, len(x) - 1, num=target_len)
+    return np.interp(xp, np.arange(len(x)), x)
+
+
+def _load_megnet_model(model_path: str):
+    """
+    Load a MEGNet model from disk using TensorFlow/Keras.
+    """
+    if not model_path:
+        raise ValueError("MEGNet model path is empty. Set MEGNET_MODEL_PATH.")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"MEGNet model not found: {model_path}")
+    from tensorflow import keras
+
+    return keras.models.load_model(model_path)
+
+
+def _get_megnet_model():
+    """
+    Lazy-load and cache the MEGNet model.
+    """
+    global _MEGNET_MODEL
+    if _MEGNET_MODEL is None:
+        _MEGNET_MODEL = _load_megnet_model(MEGNET_MODEL_PATH)
+    return _MEGNET_MODEL
+
+
+def megnet_ic_score(ic: np.ndarray, model) -> float:
+    """
+    Score a single IC using MEGNet. Returns the requested output index.
+    """
+    x = safe_zscore(ic)
+    x = _resample_to_length(x, MEGNET_INPUT_SAMPLES)
+    x = x.reshape(1, -1, 1)
+    pred = model.predict(x, verbose=0)
+    pred = np.asarray(pred).ravel()
+    if MEGNET_OUTPUT_INDEX >= len(pred):
+        raise IndexError("MEGNET_OUTPUT_INDEX is out of bounds for model output.")
+    return float(pred[MEGNET_OUTPUT_INDEX])
 
 
 # =============================================================================
@@ -586,6 +653,9 @@ def pick_best_ic_unsupervised(sources: np.ndarray, sfreq: float) -> Tuple[int, D
     Score each IC and return:
       best_ic_index, best_details, all_details_sorted(desc by score)
     """
+    mode = ICA_UNSUP_MODE.lower()
+    use_megnet = mode in {"megnet", "hybrid"}
+    model = _get_megnet_model() if use_megnet else None
     all_details: List[Dict] = []
     for i in range(sources.shape[0]):
         d_pos = unsupervised_ecg_ic_score(sources[i, :], sfreq)
@@ -596,7 +666,33 @@ def pick_best_ic_unsupervised(sources: np.ndarray, sfreq: float) -> Tuple[int, D
         else:
             d = d_pos
             d["flip_for_score"] = False
+        d["heuristic_score"] = float(d["score"])
+
+        if use_megnet:
+            m_pos = megnet_ic_score(sources[i, :], model)
+            m_neg = megnet_ic_score(-sources[i, :], model)
+            if m_neg > m_pos:
+                megnet_score = float(m_neg)
+                megnet_flip = True
+            else:
+                megnet_score = float(m_pos)
+                megnet_flip = False
+            d["megnet_score"] = megnet_score
+            d["megnet_flip_for_score"] = megnet_flip
+
+            if mode == "megnet":
+                d["score"] = megnet_score
+            else:
+                d["score"] = (
+                    (1.0 - MEGNET_SCORE_WEIGHT) * d["heuristic_score"]
+                    + MEGNET_SCORE_WEIGHT * megnet_score
+                )
+        else:
+            d["megnet_score"] = float("nan")
+            d["megnet_flip_for_score"] = False
+
         d["ic"] = int(i)
+        d["selection_mode"] = mode
         all_details.append(d)
 
     all_sorted = sorted(all_details, key=lambda x: x["score"], reverse=True)
