@@ -109,16 +109,8 @@ UNSUP_SCORE_SECONDS = None
 # Unsupervised ICA selection mode:
 #   "heuristic": choose IC by blink-likeness score
 #   "fixed": always choose a fixed index (useful for debugging or reproducibility tests)
-#   "megnet": classify ICs with MEGNet
-#   "hybrid": MEGNet + heuristics (weighted)
-ICA_UNSUP_MODE = "heuristic"  # "heuristic" | "fixed" | "megnet" | "hybrid"
+ICA_UNSUP_MODE = "heuristic"  # "heuristic" | "fixed"
 ICA_UNSUP_FIXED_IC = 0
-
-# MEGNet configuration (used when ICA_UNSUP_MODE is "megnet" or "hybrid")
-MEGNET_MODEL_PATH = ""
-MEGNET_INPUT_SAMPLES = 2048
-MEGNET_OUTPUT_INDEX = 0
-MEGNET_SCORE_WEIGHT = 0.5
 
 # Sign convention for unsupervised IC (MEG-only):
 #   "frontal_proxy": flip sign to correlate positively with MEG-only frontal PCA proxy
@@ -219,64 +211,6 @@ def shift_with_zeros(y: np.ndarray, lag: int) -> np.ndarray:
         k = -lag
         return np.concatenate([np.zeros(k), y[:-k]])
     return y.copy()
-
-
-# =============================================================================
-# HELPERS: MEGNet inference (optional ICA classification)
-# =============================================================================
-_MEGNET_MODEL = None
-
-
-def _resample_to_length(x: np.ndarray, target_len: int) -> np.ndarray:
-    """
-    Resample a 1D array to target_len using linear interpolation.
-    """
-    if target_len <= 0:
-        raise ValueError("target_len must be positive.")
-    x = np.asarray(x, dtype=float)
-    if len(x) == target_len:
-        return x
-    if len(x) < 2:
-        return np.full(target_len, float(x[0]) if len(x) == 1 else 0.0, dtype=float)
-    xp = np.linspace(0, len(x) - 1, num=target_len)
-    return np.interp(xp, np.arange(len(x)), x)
-
-
-def _load_megnet_model(model_path: str):
-    """
-    Load a MEGNet model from disk using TensorFlow/Keras.
-    """
-    if not model_path:
-        raise ValueError("MEGNet model path is empty. Set MEGNET_MODEL_PATH.")
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"MEGNet model not found: {model_path}")
-    from tensorflow import keras
-
-    return keras.models.load_model(model_path)
-
-
-def _get_megnet_model():
-    """
-    Lazy-load and cache the MEGNet model.
-    """
-    global _MEGNET_MODEL
-    if _MEGNET_MODEL is None:
-        _MEGNET_MODEL = _load_megnet_model(MEGNET_MODEL_PATH)
-    return _MEGNET_MODEL
-
-
-def megnet_ic_score(ic: np.ndarray, model) -> float:
-    """
-    Score a single IC using MEGNet. Returns the requested output index.
-    """
-    x = safe_zscore(ic)
-    x = _resample_to_length(x, MEGNET_INPUT_SAMPLES)
-    x = x.reshape(1, -1, 1)
-    pred = model.predict(x, verbose=0)
-    pred = np.asarray(pred).ravel()
-    if MEGNET_OUTPUT_INDEX >= len(pred):
-        raise IndexError("MEGNET_OUTPUT_INDEX is out of bounds for model output.")
-    return float(pred[MEGNET_OUTPUT_INDEX])
 
 
 # =============================================================================
@@ -861,7 +795,6 @@ def pick_best_ic_unsupervised_from_sources(
     Returns:
       (best_ic_index, details_dict)
     """
-    mode = mode.lower()
     if mode == "fixed":
         idx = int(np.clip(fixed_ic, 0, sources.shape[0] - 1))
         details_pos = blink_likeness_score(sources[idx, :], sfreq)
@@ -873,13 +806,8 @@ def pick_best_ic_unsupervised_from_sources(
             details = details_pos
             details["flip_for_score"] = False
         details["selection_mode"] = "fixed"
-        details["heuristic_score"] = float(details["score"])
-        details["megnet_score"] = float("nan")
-        details["megnet_flip_for_score"] = False
         return idx, details
 
-    use_megnet = mode in {"megnet", "hybrid"}
-    model = _get_megnet_model() if use_megnet else None
     best_idx = -1
     best_score = -np.inf
     best_details = None
@@ -893,36 +821,12 @@ def pick_best_ic_unsupervised_from_sources(
         else:
             details = details_pos
             details["flip_for_score"] = False
-        details["heuristic_score"] = float(details["score"])
-
-        if use_megnet:
-            m_pos = megnet_ic_score(sources[i, :], model)
-            m_neg = megnet_ic_score(-sources[i, :], model)
-            if m_neg > m_pos:
-                megnet_score = float(m_neg)
-                megnet_flip = True
-            else:
-                megnet_score = float(m_pos)
-                megnet_flip = False
-            details["megnet_score"] = megnet_score
-            details["megnet_flip_for_score"] = megnet_flip
-            if mode == "megnet":
-                details["score"] = megnet_score
-            else:
-                details["score"] = (
-                    (1.0 - MEGNET_SCORE_WEIGHT) * details["heuristic_score"]
-                    + MEGNET_SCORE_WEIGHT * megnet_score
-                )
-        else:
-            details["megnet_score"] = float("nan")
-            details["megnet_flip_for_score"] = False
-
         if details["score"] > best_score:
             best_score = details["score"]
             best_idx = i
             best_details = details
 
-    best_details["selection_mode"] = mode
+    best_details["selection_mode"] = "heuristic"
     return int(best_idx), best_details
 
 
